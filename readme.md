@@ -9,3 +9,5 @@ I also found that Freya follows React-style coding patterns, such as the Provide
 Furthermore, Freya does not fully leverage Rust's strength in preventing mistakes through its type system, making it somewhat less convenient to work with than egui.
 
 Nevertheless, Freya has considerable potential for building clean, well-designed UIs.
+
+![freya_dnd_table](https://github.com/user-attachments/assets/da956bd6-c8b6-4b11-add9-6fe740e68a10)
