@@ -1,0 +1,24 @@
+[package]
+name = "freya_extra"
+version = "0.1.0"
+description = "Components missing from Freya and bug fixes."
+
+authors.workspace = true
+categories = ["development-tools"]
+edition.workspace = true
+keywords.workspace = true
+license.workspace = true
+readme = "../../README.md"
+repository.workspace = true
+rust-version.workspace = true
+
+
+[dependencies]
+freya = { workspace = true }
+
+
+[features]
+# default = []
+
+[lints]
+# workspace = true

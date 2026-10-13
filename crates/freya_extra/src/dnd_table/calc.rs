@@ -1,0 +1,426 @@
+// Pure, UI-independent calculations for `DndTable`.
+
+/// Active sort: `(column_index, ascending)`.
+pub type SortSpec = (usize, bool);
+
+/// How a column is sized.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ColumnWidth {
+    /// Fixed pixel width. Only fixed columns can be resized by the user.
+    Px(f32),
+    /// Take the remaining width of the table. Only the last column can fill.
+    Fill,
+}
+
+// Freya stores the vertical scroll position as a non-positive value (0 at the top),
+// while all geometry math uses a non-negative "scrolled distance".
+const SCROLL_Y_SIGN: i32 = -1;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct ResizeState {
+    pub column: usize,
+    pub start_x: f64,
+    pub start_width: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DropPosition {
+    Before,
+    After,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct DropTarget {
+    pub row_id: usize,
+    pub position: DropPosition,
+}
+
+// Vertical row bounds in global coordinates.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct RowBounds {
+    pub row_id: usize,
+    pub top: f64,
+    pub bottom: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum HandleState {
+    Idle,
+    Hovered,
+    Active,
+}
+
+impl HandleState {
+    pub(super) const fn resolve(is_resizing: bool, is_hovered: bool) -> Self {
+        if is_resizing {
+            Self::Active
+        } else if is_hovered {
+            Self::Hovered
+        } else {
+            Self::Idle
+        }
+    }
+}
+
+// --- Scrolling ---------------------------------------------------------------------------------
+
+pub(super) fn scroll_distance(raw_y: i32) -> i32 {
+    (raw_y * SCROLL_Y_SIGN).max(0)
+}
+
+pub(super) fn raw_scroll_y(distance: i32) -> i32 {
+    distance.max(0) * SCROLL_Y_SIGN
+}
+
+// One insert line above and below every row.
+pub(super) fn content_height(row_count: usize, row_height: f32, line_height: f32) -> f64 {
+    (row_count as f64).mul_add(f64::from(row_height + line_height), f64::from(line_height))
+}
+
+pub(super) fn max_scroll_y(content_height: f64, viewport_height: f64) -> i32 {
+    (content_height - viewport_height).max(0.0) as i32
+}
+
+pub(super) fn auto_scroll_y(
+    pointer_y: f64,
+    viewport_top: f64,
+    viewport_bottom: f64,
+    current_y: i32,
+    max_scroll_y: i32,
+    edge: f64,
+    step: i32,
+) -> i32 {
+    if pointer_y < viewport_top + edge {
+        current_y.saturating_sub(step).clamp(0, max_scroll_y)
+    } else if pointer_y > viewport_bottom - edge {
+        current_y.saturating_add(step).clamp(0, max_scroll_y)
+    } else {
+        current_y.clamp(0, max_scroll_y)
+    }
+}
+
+// --- Geometry ----------------------------------------------------------------------------------
+
+// `global_y` / `local_y`: pointer position relative to the window / to the row.
+pub(super) fn viewport_top(
+    global_y: f64,
+    local_y: f64,
+    row_index: usize,
+    scroll_y: i32,
+    row_height: f32,
+    line_height: f32,
+) -> f64 {
+    let row_top = global_y - local_y;
+    let content_row_top =
+        f64::from((row_index as f32).mul_add(row_height + line_height, line_height));
+
+    row_top - content_row_top + f64::from(scroll_y)
+}
+
+pub(super) fn row_bounds(
+    row_ids: &[usize],
+    viewport_top: f64,
+    scroll_y: i32,
+    row_height: f32,
+    line_height: f32,
+) -> Vec<RowBounds> {
+    let row_height = f64::from(row_height);
+    let line_height = f64::from(line_height);
+    let stride = row_height + line_height;
+
+    row_ids
+        .iter()
+        .enumerate()
+        .map(|(index, row_id)| {
+            let top = viewport_top + line_height + index as f64 * stride - f64::from(scroll_y);
+
+            RowBounds { row_id: *row_id, top, bottom: top + row_height }
+        })
+        .collect()
+}
+
+// --- Drag & drop -------------------------------------------------------------------------------
+
+// Top boundary inclusive, bottom exclusive. `None` if the pointer is outside every row.
+pub(super) fn find_drop_target(rows: &[RowBounds], pointer_y: f64) -> Option<DropTarget> {
+    let row = rows.iter().find(|row| pointer_y >= row.top && pointer_y < row.bottom)?;
+
+    let midpoint = row.top + (row.bottom - row.top) / 2.0;
+
+    Some(DropTarget {
+        row_id: row.row_id,
+        position: if pointer_y < midpoint { DropPosition::Before } else { DropPosition::After },
+    })
+}
+
+// Boundary in `0..=row_ids.len()`, measured before removing the dragged row.
+pub(super) fn insertion_boundary(row_ids: &[usize], target: DropTarget) -> Option<usize> {
+    let target_index = row_ids.iter().position(|row_id| *row_id == target.row_id)?;
+
+    Some(match target.position {
+        DropPosition::Before => target_index,
+        DropPosition::After => target_index + 1,
+    })
+}
+
+pub(super) fn is_insertion_boundary(
+    row_ids: &[usize],
+    target: Option<DropTarget>,
+    boundary: usize,
+) -> bool {
+    target.is_some_and(|target| insertion_boundary(row_ids, target) == Some(boundary))
+}
+
+// `(from_id, target_row_id, before)`; `None` when dropped onto itself.
+pub(super) fn reorder_args(from_id: usize, target: DropTarget) -> Option<(usize, usize, bool)> {
+    (target.row_id != from_id).then_some((
+        from_id,
+        target.row_id,
+        target.position == DropPosition::Before,
+    ))
+}
+
+// --- Columns -----------------------------------------------------------------------------------
+
+pub(super) fn resized_width(
+    start_width: f32,
+    start_x: f64,
+    current_x: f64,
+    min: f32,
+    max: f32,
+) -> f32 {
+    (start_width + (current_x - start_x) as f32).clamp(min, max)
+}
+
+pub(super) fn set_column_width(widths: &mut Vec<Option<f32>>, column: usize, width: f32) {
+    if widths.len() <= column {
+        widths.resize(column + 1, None);
+    }
+    widths[column] = Some(width);
+}
+
+pub(super) const fn is_last_column(column: usize, column_count: usize) -> bool {
+    column == column_count.saturating_sub(1)
+}
+
+// User override first, then the declared width. Only the last column may fill.
+pub(super) fn resolve_column_width(
+    override_px: Option<f32>,
+    declared: Option<ColumnWidth>,
+    is_last: bool,
+    min_column_width: f32,
+) -> ColumnWidth {
+    match (override_px, declared.unwrap_or(ColumnWidth::Px(min_column_width))) {
+        (Some(px), _) => ColumnWidth::Px(px),
+        (None, ColumnWidth::Fill) if !is_last => ColumnWidth::Px(min_column_width),
+        (None, declared) => declared,
+    }
+}
+
+// Resizable columns draw their separator inside the resize handle instead.
+pub(super) const fn separator_width(show_column_lines: bool, is_last: bool, resizable: bool) -> f32 {
+    if show_column_lines && !is_last && !resizable { 1.0 } else { 0.0 }
+}
+
+pub(super) fn content_width(width: ColumnWidth, handle_width: f32, separator: f32) -> ColumnWidth {
+    match width {
+        ColumnWidth::Px(px) => ColumnWidth::Px((px - handle_width - separator).max(0.0)),
+        ColumnWidth::Fill => ColumnWidth::Fill,
+    }
+}
+
+// --- Sorting -----------------------------------------------------------------------------------
+
+// Ascending, then descending, then unsorted.
+pub(super) fn next_sort(current: Option<SortSpec>, column: usize) -> Option<SortSpec> {
+    match current {
+        Some((sorted, true)) if sorted == column => Some((column, false)),
+        Some((sorted, false)) if sorted == column => None,
+        _ => Some((column, true)),
+    }
+}
+
+pub(super) fn header_text(
+    title: &str,
+    sort: Option<SortSpec>,
+    column: usize,
+    sortable: bool,
+) -> String {
+    match sort {
+        Some((sorted, ascending)) if sortable && sorted == column => {
+            let arrow = if ascending { "↑" } else { "↓" };
+            format!("{title} {arrow}")
+        }
+        _ => title.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    // #[expect(clippy::float_cmp)]
+    fn resized_width_clamps_to_limits() {
+        assert_eq!(resized_width(100.0, 50.0, 70.0, 48.0, 1200.0), 120.0);
+        assert_eq!(resized_width(100.0, 50.0, -500.0, 48.0, 1200.0), 48.0);
+        assert_eq!(resized_width(100.0, 50.0, 5000.0, 48.0, 1200.0), 1200.0);
+    }
+
+    #[test]
+    fn find_drop_target_identifies_row_and_side() {
+        let rows = [
+            RowBounds { row_id: 10, top: 100.0, bottom: 140.0 },
+            RowBounds { row_id: 20, top: 140.0, bottom: 180.0 },
+        ];
+
+        assert_eq!(
+            find_drop_target(&rows, 110.0),
+            Some(DropTarget { row_id: 10, position: DropPosition::Before })
+        );
+        assert_eq!(
+            find_drop_target(&rows, 130.0),
+            Some(DropTarget { row_id: 10, position: DropPosition::After })
+        );
+        assert_eq!(
+            find_drop_target(&rows, 140.0),
+            Some(DropTarget { row_id: 20, position: DropPosition::Before })
+        );
+        assert_eq!(find_drop_target(&rows, 180.0), None);
+        assert_eq!(find_drop_target(&rows, 90.0), None);
+    }
+
+    #[test]
+    fn insertion_boundary_resolves_target_row() {
+        let row_ids = [10, 20, 30, 40];
+
+        assert_eq!(
+            insertion_boundary(&row_ids, DropTarget { row_id: 20, position: DropPosition::Before }),
+            Some(1)
+        );
+        assert_eq!(
+            insertion_boundary(&row_ids, DropTarget { row_id: 20, position: DropPosition::After }),
+            Some(2)
+        );
+        assert_eq!(
+            insertion_boundary(&row_ids, DropTarget { row_id: 99, position: DropPosition::Before }),
+            None
+        );
+    }
+
+    #[test]
+    fn is_insertion_boundary_matches_only_the_resolved_line() {
+        let row_ids = [10, 20, 30];
+        let target = Some(DropTarget { row_id: 20, position: DropPosition::After });
+
+        assert!(is_insertion_boundary(&row_ids, target, 2));
+        assert!(!is_insertion_boundary(&row_ids, target, 1));
+        assert!(!is_insertion_boundary(&row_ids, None, 2));
+    }
+
+    #[test]
+    fn reorder_args_ignores_drop_onto_self() {
+        let before = DropTarget { row_id: 20, position: DropPosition::Before };
+        let after = DropTarget { row_id: 20, position: DropPosition::After };
+
+        assert_eq!(reorder_args(10, before), Some((10, 20, true)));
+        assert_eq!(reorder_args(10, after), Some((10, 20, false)));
+        assert_eq!(reorder_args(20, before), None);
+    }
+
+    #[test]
+    fn auto_scroll_moves_above_and_below_viewport() {
+        assert_eq!(auto_scroll_y(-10.0, 0.0, 100.0, 48, 200, 28.0, 24), 24);
+        assert_eq!(auto_scroll_y(110.0, 0.0, 100.0, 48, 200, 28.0, 24), 72);
+        assert_eq!(auto_scroll_y(50.0, 0.0, 100.0, 48, 200, 28.0, 24), 48);
+    }
+
+    #[test]
+    fn auto_scroll_stays_within_scroll_limits() {
+        assert_eq!(auto_scroll_y(-10.0, 0.0, 100.0, 8, 200, 28.0, 24), 0);
+        assert_eq!(auto_scroll_y(110.0, 0.0, 100.0, 192, 200, 28.0, 24), 200);
+    }
+
+    #[test]
+    fn scroll_conversion_round_trips_and_clamps() {
+        assert_eq!(scroll_distance(-48), 48);
+        assert_eq!(scroll_distance(5), 0);
+        assert_eq!(raw_scroll_y(48), -48);
+        assert_eq!(raw_scroll_y(-3), 0);
+    }
+
+    #[test]
+    fn content_height_and_max_scroll() {
+        assert_eq!(content_height(3, 36.0, 4.0), 124.0);
+        assert_eq!(max_scroll_y(124.0, 100.0), 24);
+        assert_eq!(max_scroll_y(50.0, 100.0), 0);
+    }
+
+    #[test]
+    fn row_bounds_follow_scroll_offset() {
+        let rows = row_bounds(&[1, 2], 100.0, 10, 36.0, 4.0);
+
+        assert_eq!(rows[0], RowBounds { row_id: 1, top: 94.0, bottom: 130.0 });
+        assert_eq!(rows[1], RowBounds { row_id: 2, top: 134.0, bottom: 170.0 });
+    }
+
+    #[test]
+    fn viewport_top_cancels_row_offset_and_scroll() {
+        assert_eq!(viewport_top(150.0, 10.0, 2, 8, 36.0, 4.0), 64.0);
+    }
+
+    #[test]
+    fn set_column_width_grows_the_override_list() {
+        let mut widths = vec![None; 1];
+        set_column_width(&mut widths, 2, 90.0);
+
+        assert_eq!(widths, vec![None, None, Some(90.0)]);
+    }
+
+    #[test]
+    fn resolve_column_width_applies_priority_and_fill_rules() {
+        use ColumnWidth::{Fill, Px};
+
+        assert_eq!(resolve_column_width(Some(80.0), Some(Fill), false, 48.0), Px(80.0));
+        assert_eq!(resolve_column_width(None, Some(Fill), false, 48.0), Px(48.0));
+        assert_eq!(resolve_column_width(None, Some(Fill), true, 48.0), Fill);
+        assert_eq!(resolve_column_width(None, Some(Px(120.0)), false, 48.0), Px(120.0));
+        assert_eq!(resolve_column_width(None, None, false, 48.0), Px(48.0));
+    }
+
+    #[test]
+    fn separator_and_content_width() {
+        assert_eq!(separator_width(true, false, false), 1.0);
+        assert_eq!(separator_width(true, true, false), 0.0);
+        assert_eq!(separator_width(true, false, true), 0.0);
+        assert_eq!(separator_width(false, false, false), 0.0);
+
+        assert_eq!(content_width(ColumnWidth::Px(100.0), 12.0, 1.0), ColumnWidth::Px(87.0));
+        assert_eq!(content_width(ColumnWidth::Px(5.0), 12.0, 0.0), ColumnWidth::Px(0.0));
+        assert_eq!(content_width(ColumnWidth::Fill, 12.0, 1.0), ColumnWidth::Fill);
+    }
+
+    #[test]
+    fn next_sort_cycles_asc_desc_none() {
+        assert_eq!(next_sort(None, 1), Some((1, true)));
+        assert_eq!(next_sort(Some((1, true)), 1), Some((1, false)));
+        assert_eq!(next_sort(Some((1, false)), 1), None);
+        assert_eq!(next_sort(Some((2, false)), 1), Some((1, true)));
+    }
+
+    #[test]
+    fn header_text_shows_arrow_only_for_active_sortable_column() {
+        assert_eq!(header_text("Name", Some((0, true)), 0, true), "Name ↑");
+        assert_eq!(header_text("Name", Some((0, false)), 0, true), "Name ↓");
+        assert_eq!(header_text("Name", Some((0, true)), 0, false), "Name");
+        assert_eq!(header_text("Name", Some((1, true)), 0, true), "Name");
+        assert_eq!(header_text("Name", None, 0, true), "Name");
+    }
+
+    #[test]
+    fn handle_state_prefers_active_over_hovered() {
+        assert_eq!(HandleState::resolve(true, true), HandleState::Active);
+        assert_eq!(HandleState::resolve(false, true), HandleState::Hovered);
+        assert_eq!(HandleState::resolve(false, false), HandleState::Idle);
+    }
+}
