@@ -24,7 +24,7 @@ pub const DARK_GLASS_COLORS: ColorsSheet = ColorsSheet {
     info: hex("#64D2FFFF"),
 
     // Background and Glass Surfaces
-    background: hex("#0c101862"),
+    background: hex("#0c1018d5"),
     surface_primary: hex("#232b37b2"),
     surface_secondary: hex("#525d6da1"),
     surface_tertiary: hex("#414B5A9B"),

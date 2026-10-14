@@ -8,5 +8,5 @@ mod table;
 
 pub use self::table::{
     ColumnWidth, Density, DndTable, DndTableBody, DndTableCell, DndTableHead, DndTableRow,
-    SortSpec, TableMetrics,
+    SortDirection, SortSpec, TableMetrics,
 };

@@ -8,9 +8,9 @@ use std::sync::Arc;
 
 use freya::prelude::*;
 
-pub use super::calc::{ColumnWidth, SortSpec};
+pub use super::calc::{ColumnWidth, SortDirection, SortSpec};
 use super::{
-    calc::{self, HandleState, is_last_column},
+    calc::{self, HandleState},
     hooks::{
         DndTableContext, ReorderHandler, SortHandler, TableConfig, same_callback,
         use_dnd_table_context, use_dragged_row_id, use_row_dragging, use_table_context,
@@ -21,6 +21,8 @@ use super::{
 fn size(width: ColumnWidth) -> Size {
     match width {
         ColumnWidth::Px(px) => Size::px(px),
+        // Cells resolve ratios to pixels themselves; this is only a fallback.
+        ColumnWidth::Ratio(ratio) => Size::percent(ratio * 100.0),
         ColumnWidth::Fill => Size::fill(),
     }
 }
@@ -129,6 +131,7 @@ pub struct DndTable {
     fixed_width: Option<f32>,
     show_column_lines: bool,
     sort: Option<SortSpec>,
+    default_sort: Option<SortSpec>,
     on_reorder: Option<ReorderHandler>,
     on_sort: Option<SortHandler>,
 }
@@ -151,12 +154,17 @@ impl DndTable {
             fixed_width: None,
             show_column_lines: true,
             sort: None,
+            default_sort: None,
             on_reorder: None,
             on_sort: None,
         }
     }
 
     /// Column sizing, in order. Missing entries default to `min_column_width`.
+    ///
+    /// Use [`ColumnWidth::Ratio`] to size a column as a fraction of the table width. Keep the
+    /// ratios of the non-last columns below `1.0` in total and end with [`ColumnWidth::Fill`]:
+    /// the body's scrollbar takes some width from the rows but not from the header.
     #[inline]
     pub fn columns(mut self, columns: impl IntoIterator<Item = ColumnWidth>) -> Self {
         self.columns = columns.into_iter().collect();
@@ -267,6 +275,17 @@ impl DndTable {
         self
     }
 
+    /// The order the rows have while no sort is active (`on_sort` receives `None`).
+    ///
+    /// Set this when the source data already has a meaningful order, for example priority
+    /// ascending. The header of that column is then shown as sorted from the start, and its
+    /// first click flips the direction instead of repeating it.
+    #[inline]
+    pub fn default_sort(mut self, sort: Option<SortSpec>) -> Self {
+        self.default_sort = sort;
+        self
+    }
+
     /// Set the reorder callback.
     ///
     /// Arguments are `(from_id, target_row_id, before)`.
@@ -279,7 +298,8 @@ impl DndTable {
 
     /// Called when a sortable header is clicked.
     ///
-    /// The argument is the next sort: ascending, then descending, then `None`.
+    /// The argument is the next sort: the column's first direction, then the opposite one,
+    /// then `None` (back to [`DndTable::default_sort`]). See [`DndTableCell::sort_direction`].
     #[inline]
     pub fn on_sort(mut self, callback: impl Fn(Option<SortSpec>) + 'static) -> Self {
         self.on_sort = Some(Arc::new(callback));
@@ -309,6 +329,7 @@ impl Component for DndTable {
             columns: self.columns.clone(),
             show_column_lines: self.show_column_lines,
             sort: self.sort,
+            default_sort: self.default_sort,
             on_reorder: self.on_reorder.clone(),
             on_sort: self.on_sort.clone(),
         });
@@ -335,6 +356,12 @@ impl Component for DndTable {
         let mut up_context = context.clone();
         let on_global_pointer_up = move |_| up_context.end_resize();
 
+        // `Ratio` columns are resolved against this width.
+        let mut table_width = context.table_width;
+        let on_sized = move |event: Event<SizedEventData>| {
+            table_width.set_if_modified(event.area.width());
+        };
+
         let mut drop_context = context.clone();
         let drop_zone = DropZone::new(move |from_id: usize| drop_context.finish_drop(from_id))
             .child(rect().width(outer_width.clone()).spacing(0.0).children(self.children.clone()));
@@ -343,6 +370,7 @@ impl Component for DndTable {
             .width(outer_width)
             .spacing(0.0)
             .corner_radius(CornerRadius::new(12.0, 12.0, 12.0, 12.0))
+            .on_sized(on_sized)
             .on_global_pointer_move(on_global_pointer_move)
             .on_global_pointer_up(on_global_pointer_up);
 
@@ -363,6 +391,7 @@ impl PartialEq for DndTable {
             && self.fixed_width == other.fixed_width
             && self.show_column_lines == other.show_column_lines
             && self.sort == other.sort
+            && self.default_sort == other.default_sort
             && same_callback(&self.on_reorder, &other.on_reorder)
             && same_callback(&self.on_sort, &other.on_sort)
     }
@@ -616,6 +645,7 @@ pub struct DndTableCell {
     title: Option<String>,
     is_header: bool,
     sortable: bool,
+    first_direction: SortDirection,
     resizable: bool,
 }
 
@@ -660,14 +690,25 @@ impl DndTableCell {
         self
     }
 
-    /// Make the header clickable to cycle the sort (ascending, descending, none).
+    /// Make the header clickable to cycle the sort (first direction, opposite, none).
     #[inline]
     pub fn sortable(mut self, enabled: bool) -> Self {
         self.sortable = enabled;
         self
     }
 
-    /// Allow the user to resize the column. Only fixed-width columns can be resized.
+    /// Direction of the first click on this header (default: ascending).
+    ///
+    /// Use [`SortDirection::Descending`] for columns where the largest value is the most
+    /// interesting, such as dates. It is ignored for the column of [`DndTable::default_sort`],
+    /// which already starts in that order.
+    #[inline]
+    pub fn sort_direction(mut self, direction: SortDirection) -> Self {
+        self.first_direction = direction;
+        self
+    }
+
+    /// Allow the user to resize the column. `Px` and `Ratio` columns can be resized, `Fill` cannot.
     #[inline]
     pub fn resizable(mut self, enabled: bool) -> Self {
         self.resizable = enabled;
@@ -678,23 +719,37 @@ impl DndTableCell {
 impl Component for DndTableCell {
     fn render(&self) -> impl IntoElement {
         let context = use_table_context();
-        let config = context.config.read().clone();
-        let (metrics, colors) = (config.metrics, config.colors);
-
         let column = self.column.unwrap_or(0);
+
+        let (metrics, colors, show_column_lines, column_count, declared_width, sort, default_sort) = {
+            let config = context.config.read();
+
+            (
+                config.metrics,
+                config.colors,
+                config.show_column_lines,
+                config.columns.len(),
+                config.columns.get(column).copied(),
+                config.sort,
+                config.default_sort,
+            )
+        };
+
         let row_dragging = use_dragged_row_id().is_some();
-        let is_last = is_last_column(column, config.columns.len());
+        let is_last = calc::is_last_column(column, column_count);
 
         let width = calc::resolve_column_width(
             context.column_width_override(column),
-            config.columns.get(column).copied(),
+            declared_width,
             is_last,
             metrics.min_column_width,
+            metrics.max_column_width,
+            context.table_width(),
         );
 
         let resizable = self.resizable && matches!(width, ColumnWidth::Px(_));
         let handle_width = if resizable { metrics.resize_handle_width } else { 0.0 };
-        let separator_width = calc::separator_width(config.show_column_lines, is_last, resizable);
+        let separator_width = calc::separator_width(show_column_lines, is_last, resizable);
         let content_width = calc::content_width(width, handle_width, separator_width);
 
         let mut content = rect()
@@ -707,21 +762,27 @@ impl Component for DndTableCell {
             content = content.background(Color::TRANSPARENT);
 
             if let Some(title) = &self.title {
-                let text = calc::header_text(title, config.sort, column, self.sortable);
+                let sort = calc::effective_sort(sort, default_sort);
+                let text = calc::header_text(title, sort, column, self.sortable);
                 content = content.child(styled::header_label(text, colors));
             }
         }
 
         if self.is_header && self.sortable {
             let sort_context = context.clone();
-            content = content.on_mouse_up(move |_| sort_context.request_sort(column));
+            let first_direction = self.first_direction;
+
+            // `pointer_press` fires only on the node where the pointer went down. `mouse_up`
+            // also fired when a row drag was released over the header and sorted by mistake.
+            content = content
+                .on_pointer_press(move |_| sort_context.request_sort(column, first_direction));
         }
 
         let mut parts: Vec<Element> = vec![content.children(self.children.clone()).into()];
 
         if resizable && let ColumnWidth::Px(px) = width {
             parts.push(resize_handle(&context, metrics, colors, column, px, row_dragging));
-        } else if config.show_column_lines && !is_last {
+        } else if show_column_lines && !is_last {
             parts.push(styled::grid_separator(colors));
         }
 

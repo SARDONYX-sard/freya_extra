@@ -3,6 +3,7 @@ use freya::prelude::*;
 use super::liquid_glass::LIQUID_GLASS_COLORS;
 use crate::color_picker::ColorPicker;
 use crate::dropdown_menu::DropdownMenu;
+use crate::floating_window::FloatingWindow;
 use crate::themes;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -229,79 +230,57 @@ impl Component for ThemeEditor {
         let colors = custom_colors;
         let active_theme = theme;
 
-        let floating_window = DraggableCanvas::new().maybe_child(if show_editor() {
-            Some(
-                Draggable::new().initial_position((40.0, 40.0)).child(
-                    rect()
-                        .layer(999)
-                        .width(Size::px(420.0))
-                        .height(Size::px(560.0))
-                        .padding(12.0)
-                        .spacing(8.0)
-                        .vertical()
-                        .child(
-                            rect()
-                                .horizontal()
-                                .cross_align(Alignment::Center)
-                                .spacing(8.0)
-                                .child(label().text("Custom Theme").font_size(16.0))
-                                .child(
-                                    Button::new()
-                                        .on_press(move |_| show_editor.set(false))
-                                        .child("Close"),
-                                ),
-                        )
-                        .child(
-                            VirtualScrollView::new(move |item, _| {
-                                let field = ColorField::ALL[item.index];
+        let color_list = VirtualScrollView::new(move |item, _| {
+            let field = ColorField::ALL[item.index];
 
-                                let snapshot = colors.read().clone();
-                                let current_color = field.get(&snapshot);
+            let snapshot = colors.read().clone();
+            let current_color = field.get(&snapshot);
 
-                                let mut row_colors = colors;
-                                let mut row_theme = active_theme;
+            let mut row_colors = colors;
+            let mut row_theme = active_theme;
 
-                                rect()
-                                    .horizontal()
-                                    .cross_align(Alignment::Center)
-                                    .width(Size::fill())
-                                    .height(Size::px(item.size))
-                                    .padding(6.0)
-                                    .spacing(8.0)
-                                    .child(
-                                        rect()
-                                            .width(Size::fill())
-                                            .child(label().text(field.name()).font_size(13.0)),
-                                    )
-                                    .child(
-                                        ColorPicker::new(move |color| {
-                                            let mut updated = row_colors.read().clone();
+            rect()
+                .horizontal()
+                .cross_align(Alignment::Center)
+                .width(Size::fill())
+                .height(Size::px(item.size))
+                .padding(6.0)
+                .spacing(8.0)
+                .child(label().text(field.name()).font_size(13.0))
+                .child(
+                    ColorPicker::new(move |color| {
+                        let mut updated = row_colors.read().clone();
 
-                                            field.set(&mut updated, color);
+                        field.set(&mut updated, color);
 
-                                            row_colors.set(updated.clone());
-                                            row_theme.set(custom_theme(updated));
-                                        })
-                                        .value(current_color),
-                                    )
-                                    .into()
-                            })
-                            .length(ColorField::ALL.len())
-                            .item_size(64.0)
-                            .width(Size::fill())
-                            .max_height(Size::px(470.0)),
-                        ),
-                ),
-            )
-        } else {
-            None
-        });
+                        row_colors.set(updated.clone());
+                        row_theme.set(custom_theme(updated));
+                    })
+                    .value(current_color),
+                )
+                .into()
+        })
+        .length(ColorField::ALL.len())
+        .item_size(64.0)
+        .width(Size::fill())
+        // An explicit height: the default is `fill`, which collapses to 0 inside the
+        // window body because the body is sized by its content.
+        .height(Size::px(470.0));
+
+        // The editor only makes sense for the custom theme: hide it when another theme is picked,
+        // but keep `show_editor` so it reappears when switching back to Custom.
+        let editor_window = FloatingWindow::new("Custom Theme")
+            .open(show_editor() && mode == ThemeMode::Custom)
+            .on_close(move |_| show_editor.set(false))
+            .initial_position(40.0, 40.0)
+            .width(420.0)
+            .child(color_list);
 
         rect()
             .horizontal()
             .spacing(8.0)
             .cross_align(Alignment::Center)
             .child(selector)
-            .child(floating_window)
+            .child(editor_window)
     }
 }

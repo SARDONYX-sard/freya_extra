@@ -6,7 +6,7 @@ use freya::prelude::*;
 
 use super::{
     TableMetrics,
-    calc::{self, ColumnWidth, DropTarget, ResizeState, SortSpec},
+    calc::{self, ColumnWidth, DropTarget, ResizeState, SortDirection, SortSpec},
     styled::TableColors,
 };
 
@@ -22,6 +22,8 @@ pub(super) struct TableConfig {
     pub columns: Vec<ColumnWidth>,
     pub show_column_lines: bool,
     pub sort: Option<SortSpec>,
+    // Order shown while `sort` is `None`; its column flips on the first click.
+    pub default_sort: Option<SortSpec>,
     pub on_reorder: Option<ReorderHandler>,
     pub on_sort: Option<SortHandler>,
 }
@@ -41,6 +43,7 @@ impl PartialEq for TableConfig {
             && self.columns == other.columns
             && self.show_column_lines == other.show_column_lines
             && self.sort == other.sort
+            && self.default_sort == other.default_sort
             && same_callback(&self.on_reorder, &other.on_reorder)
             && same_callback(&self.on_sort, &other.on_sort)
     }
@@ -49,7 +52,10 @@ impl PartialEq for TableConfig {
 #[derive(Clone)]
 pub(super) struct DndTableContext {
     pub config: State<TableConfig>,
+    // User-resized widths as fractions of the table width.
     pub column_width_overrides: State<Vec<Option<f32>>>,
+    // Measured outer width of the table in pixels (`0.0` until the first layout).
+    pub table_width: State<f32>,
     pub drop_target: State<Option<DropTarget>>,
     // Stable drag IDs in display order.
     pub row_ids: State<Vec<usize>>,
@@ -66,6 +72,7 @@ pub(super) fn use_dnd_table_context(next_config: TableConfig) -> DndTableContext
     let viewport_bounds = use_state(|| None::<(f64, f64)>);
     let resize_state = use_state(|| None::<ResizeState>);
     let hovered_boundary = use_state(|| None::<usize>);
+    let table_width = use_state(|| 0.0_f32);
     let column_count = next_config.columns.len();
     let column_width_overrides = use_state(|| vec![None; column_count]);
     let scroll_controller = use_scroll_controller(ScrollConfig::default);
@@ -78,6 +85,7 @@ pub(super) fn use_dnd_table_context(next_config: TableConfig) -> DndTableContext
     let context = DndTableContext {
         config,
         column_width_overrides,
+        table_width,
         drop_target,
         row_ids,
         viewport_bounds,
@@ -135,6 +143,11 @@ impl DndTableContext {
         *self.hovered_boundary.read() == Some(column)
     }
 
+    pub(super) fn table_width(&self) -> f32 {
+        *self.table_width.read()
+    }
+
+    // Ratio of the table width, set by the last user resize.
     pub(super) fn column_width_override(&self, column: usize) -> Option<f32> {
         self.column_width_overrides.read().get(column).copied().flatten()
     }
@@ -164,9 +177,17 @@ impl DndTableContext {
             metrics.max_column_width,
         );
 
-        let mut widths = self.column_width_overrides.read().clone();
-        calc::set_column_width(&mut widths, resize.column, width);
-        self.column_width_overrides.set(widths);
+        // Store a ratio so the column keeps its proportion when the window is resized.
+        // Nothing to store until the table has been measured.
+        if let Some(ratio) = calc::px_to_ratio(width, self.table_width()) {
+            let current = self.column_width_overrides.read().get(resize.column).copied().flatten();
+
+            if current != Some(ratio) {
+                let mut widths = self.column_width_overrides.read().clone();
+                calc::set_column_width(&mut widths, resize.column, ratio);
+                self.column_width_overrides.set(widths);
+            }
+        }
 
         true
     }
@@ -269,18 +290,20 @@ impl DndTableContext {
 
     // --- Sorting -----------------------------------------------------------------------------
 
-    pub(super) fn request_sort(&self, column: usize) {
+    // `first_direction`: direction of the first click, declared by the header cell.
+    pub(super) fn request_sort(&self, column: usize, first_direction: SortDirection) {
         if self.is_resizing() {
             return;
         }
 
-        let (current, callback) = {
+        let (current, default, callback) = {
             let config = self.config.read();
-            (config.sort, config.on_sort.clone())
+            (config.sort, config.default_sort, config.on_sort.clone())
         };
 
         if let Some(callback) = callback {
-            callback(calc::next_sort(current, column));
+            let next = calc::next_sort(current, default, column, first_direction.is_ascending());
+            callback(next);
         }
     }
 }

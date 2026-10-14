@@ -12,8 +12,8 @@ pub fn theme() -> Theme {
 
 pub const LIQUID_GLASS_COLORS: ColorsSheet = ColorsSheet {
     // Brand and Accent
-    primary: hex("#B8B8B8FF"),
-    secondary: hex("#D9D9D9FF"),
+    primary: hex("#736F6FFF"),
+    secondary: hex("#FFFFFFFF"),
     tertiary: hex("#EEEEEEFF"),
 
     // Status
@@ -23,17 +23,17 @@ pub const LIQUID_GLASS_COLORS: ColorsSheet = ColorsSheet {
     info: hex("#B9C7D6FF"),
 
     // Translucent Glass Surfaces
-    background: hex("#77777720"),
-    surface_primary: hex("#a7a4a49a"),
+    background: hex("#777777DA"),
+    surface_primary: hex("#A0A0A097"),
     surface_secondary: hex("#64646411"),
-    surface_tertiary: hex("#ffffff31"),
+    surface_tertiary: hex("#FFFFFF31"),
     surface_inverse: hex("#292929E8"),
     surface_inverse_secondary: hex("#383838D8"),
     surface_inverse_tertiary: hex("#4A4A4AC8"),
 
     // Glass Edges
     border: hex("#FFFFFF55"),
-    border_focus: hex("#FFFFFFFF"),
+    border_focus: hex("#DDDDDD"),
     border_disabled: hex("#FFFFFF24"),
 
     // Text

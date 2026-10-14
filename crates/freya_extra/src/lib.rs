@@ -4,5 +4,5 @@ pub mod acrylic;
 pub mod color_picker;
 pub mod dnd_table;
 pub mod dropdown_menu;
-pub mod glass;
+pub mod floating_window;
 pub mod themes;

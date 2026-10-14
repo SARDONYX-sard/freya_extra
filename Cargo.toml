@@ -31,6 +31,19 @@ opt-level = 3
 # panic = 'abort'
 strip = true
 
+# - ref: https://doc.rust-lang.org/cargo/reference/profiles.html#release
+[profile.release-no-lto]
+inherits = "dev"
+opt-level = 3
+debug = false
+strip = "none"
+debug-assertions = false
+overflow-checks = false
+lto = false
+panic = 'unwind'
+incremental = false
+codegen-units = 16
+rpath = false
 
 [workspace.lints.rust]
 bad_style = "deny"

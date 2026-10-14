@@ -87,6 +87,7 @@ impl Component for ColorPicker {
         let mut preview_area = use_state(|| None::<Area>);
         let mut popup_size = use_state(|| None::<Size2D>);
 
+        let theme = get_theme!(&self.theme, ColorPickerThemePreference, "color_picker");
         let is_open = open();
 
         let preview = rect()
@@ -94,12 +95,13 @@ impl Component for ColorPicker {
             .height(Size::px(24.))
             .corner_radius(4.)
             .background(self.value)
+            .border(
+                Border::new().fill(theme.border_fill).width(1.).alignment(BorderAlignment::Inner),
+            )
             .on_sized(move |e: Event<SizedEventData>| preview_area.set_if_modified(Some(e.area)))
             .on_press(move |_| {
                 open.toggle();
             });
-
-        let theme = get_theme!(&self.theme, ColorPickerThemePreference, "color_picker");
 
         let hue_bar = {
             let hsv = color.read().to_hsv();
@@ -242,11 +244,23 @@ impl Component for ColorPicker {
             let on_change = self.on_change.clone();
             move |coords: CursorPoint| {
                 let sv_area = area.read().to_f64();
-                let sat = ((coords.x - sv_area.min_x()) / sv_area.width()).clamp(0., 1.) as f32;
-                let rel_y = ((coords.y - sv_area.min_y()) / sv_area.height()).clamp(0., 1.) as f32;
+
+                // NOTE: Avoid division by zero when the SV area has not been laid out.
+                let width = sv_area.width();
+                let height = sv_area.height();
+                if width <= 0.0 || height <= 0.0 {
+                    return;
+                }
+
+                let sat = ((coords.x - sv_area.min_x()) / width).clamp(0.0, 1.0) as f32;
+                let rel_y = ((coords.y - sv_area.min_y()) / height).clamp(0.0, 1.0) as f32;
                 let v = 1.0 - rel_y;
-                let hsv = color.read().to_hsv();
-                let new_color = Color::from_hsv(hsv.h, sat, v);
+
+                let current = *color.read();
+                let hsv = current.to_hsv();
+                let rgb = Color::from_hsv(hsv.h, sat, v);
+                let new_color = Color::from_argb(current.a(), rgb.r(), rgb.g(), rgb.b());
+
                 color.set_if_modified_and_then(new_color, || on_change.call(new_color));
             }
         };

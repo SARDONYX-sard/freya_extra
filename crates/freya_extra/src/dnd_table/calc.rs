@@ -3,11 +3,27 @@
 /// Active sort: `(column_index, ascending)`.
 pub type SortSpec = (usize, bool);
 
+/// Direction of the first click on a sortable header.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SortDirection {
+    #[default]
+    Ascending,
+    Descending,
+}
+
+impl SortDirection {
+    pub(super) const fn is_ascending(self) -> bool {
+        matches!(self, Self::Ascending)
+    }
+}
+
 /// How a column is sized.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ColumnWidth {
     /// Fixed pixel width. Only fixed columns can be resized by the user.
     Px(f32),
+    /// Fraction of the table width (`0.25` = 25%). Stays proportional when the table is resized.
+    Ratio(f32),
     /// Take the remaining width of the table. Only the last column can fill.
     Fill,
 }
@@ -203,40 +219,102 @@ pub(super) const fn is_last_column(column: usize, column_count: usize) -> bool {
     column == column_count.saturating_sub(1)
 }
 
-// User override first, then the declared width. Only the last column may fill.
+// User override (a ratio) first, then the declared width. Only the last column may fill.
+//
+// `Ratio` is resolved to pixels with `table_width`. Until the table has been measured
+// (`table_width <= 0.0`) it falls back to the minimum width.
 pub(super) fn resolve_column_width(
-    override_px: Option<f32>,
+    override_ratio: Option<f32>,
     declared: Option<ColumnWidth>,
     is_last: bool,
     min_column_width: f32,
+    max_column_width: f32,
+    table_width: f32,
 ) -> ColumnWidth {
-    match (override_px, declared.unwrap_or(ColumnWidth::Px(min_column_width))) {
-        (Some(px), _) => ColumnWidth::Px(px),
-        (None, ColumnWidth::Fill) if !is_last => ColumnWidth::Px(min_column_width),
-        (None, declared) => declared,
+    let to_px = |ratio: f32| {
+        if table_width > 0.0 {
+            ColumnWidth::Px((ratio * table_width).clamp(min_column_width, max_column_width))
+        } else {
+            ColumnWidth::Px(min_column_width)
+        }
+    };
+
+    if let Some(ratio) = override_ratio {
+        return to_px(ratio);
+    }
+
+    match declared.unwrap_or(ColumnWidth::Px(min_column_width)) {
+        ColumnWidth::Fill if !is_last => ColumnWidth::Px(min_column_width),
+        ColumnWidth::Ratio(ratio) => to_px(ratio),
+        declared => declared,
     }
 }
 
+// Pixel width -> fraction of the table, `None` while the table is not measured yet.
+pub(super) fn px_to_ratio(px: f32, table_width: f32) -> Option<f32> {
+    (table_width > 0.0).then(|| px / table_width)
+}
+
 // Resizable columns draw their separator inside the resize handle instead.
-pub(super) const fn separator_width(show_column_lines: bool, is_last: bool, resizable: bool) -> f32 {
+pub(super) const fn separator_width(
+    show_column_lines: bool,
+    is_last: bool,
+    resizable: bool,
+) -> f32 {
     if show_column_lines && !is_last && !resizable { 1.0 } else { 0.0 }
 }
 
 pub(super) fn content_width(width: ColumnWidth, handle_width: f32, separator: f32) -> ColumnWidth {
     match width {
         ColumnWidth::Px(px) => ColumnWidth::Px((px - handle_width - separator).max(0.0)),
-        ColumnWidth::Fill => ColumnWidth::Fill,
+        // `Ratio` is always resolved to `Px` before this point.
+        ColumnWidth::Ratio(_) | ColumnWidth::Fill => width,
     }
 }
 
 // --- Sorting -----------------------------------------------------------------------------------
 
-// Ascending, then descending, then unsorted.
-pub(super) fn next_sort(current: Option<SortSpec>, column: usize) -> Option<SortSpec> {
-    match current {
-        Some((sorted, true)) if sorted == column => Some((column, false)),
-        Some((sorted, false)) if sorted == column => None,
-        _ => Some((column, true)),
+/// The sort that is in effect: the user's choice, else the table's default order.
+///
+/// `None` from the user means "reset to the default order", so the default must be
+/// rendered with the same arrow as an explicit choice.
+pub(super) fn effective_sort(
+    current: Option<SortSpec>,
+    default: Option<SortSpec>,
+) -> Option<SortSpec> {
+    current.or(default)
+}
+
+/// Direction of the first click on `column`.
+///
+/// The table default wins for its own column, because that column is already in that
+/// order: the first click must flip it, not repeat it.
+pub(super) fn first_direction(
+    column: usize,
+    default: Option<SortSpec>,
+    declared_ascending: bool,
+) -> bool {
+    match default {
+        Some((sorted, ascending)) if sorted == column => ascending,
+        _ => declared_ascending,
+    }
+}
+
+// `first` -> opposite -> reset to default (`None`).
+pub(super) fn next_sort(
+    current: Option<SortSpec>,
+    default: Option<SortSpec>,
+    column: usize,
+    declared_ascending: bool,
+) -> Option<SortSpec> {
+    let first = first_direction(column, default, declared_ascending);
+
+    match effective_sort(current, default) {
+        Some((sorted, ascending)) if sorted == column && ascending == first => {
+            Some((column, !first))
+        }
+        Some((sorted, _)) if sorted == column => None,
+        _ => Some((column, first)),
     }
 }
 
@@ -379,13 +457,27 @@ mod tests {
 
     #[test]
     fn resolve_column_width_applies_priority_and_fill_rules() {
-        use ColumnWidth::{Fill, Px};
+        use ColumnWidth::{Fill, Px, Ratio};
 
-        assert_eq!(resolve_column_width(Some(80.0), Some(Fill), false, 48.0), Px(80.0));
-        assert_eq!(resolve_column_width(None, Some(Fill), false, 48.0), Px(48.0));
-        assert_eq!(resolve_column_width(None, Some(Fill), true, 48.0), Fill);
-        assert_eq!(resolve_column_width(None, Some(Px(120.0)), false, 48.0), Px(120.0));
-        assert_eq!(resolve_column_width(None, None, false, 48.0), Px(48.0));
+        let resolve = |o, d, last, table| resolve_column_width(o, d, last, 48.0, 1200.0, table);
+
+        assert_eq!(resolve(Some(0.1), Some(Fill), false, 800.0), Px(80.0));
+        assert_eq!(resolve(None, Some(Fill), false, 800.0), Px(48.0));
+        assert_eq!(resolve(None, Some(Fill), true, 800.0), Fill);
+        assert_eq!(resolve(None, Some(Px(120.0)), false, 800.0), Px(120.0));
+        assert_eq!(resolve(None, None, false, 800.0), Px(48.0));
+
+        // Ratio follows the table width and respects the clamp.
+        assert_eq!(resolve(None, Some(Ratio(0.25)), false, 800.0), Px(200.0));
+        assert_eq!(resolve(None, Some(Ratio(0.25)), false, 1600.0), Px(400.0));
+        assert_eq!(resolve(None, Some(Ratio(0.01)), false, 800.0), Px(48.0));
+        assert_eq!(resolve(None, Some(Ratio(0.25)), false, 0.0), Px(48.0));
+    }
+
+    #[test]
+    fn px_to_ratio_needs_a_measured_table() {
+        assert_eq!(px_to_ratio(200.0, 800.0), Some(0.25));
+        assert_eq!(px_to_ratio(200.0, 0.0), None);
     }
 
     #[test]
@@ -402,10 +494,39 @@ mod tests {
 
     #[test]
     fn next_sort_cycles_asc_desc_none() {
-        assert_eq!(next_sort(None, 1), Some((1, true)));
-        assert_eq!(next_sort(Some((1, true)), 1), Some((1, false)));
-        assert_eq!(next_sort(Some((1, false)), 1), None);
-        assert_eq!(next_sort(Some((2, false)), 1), Some((1, true)));
+        assert_eq!(next_sort(None, None, 1, true), Some((1, true)));
+        assert_eq!(next_sort(Some((1, true)), None, 1, true), Some((1, false)));
+        assert_eq!(next_sort(Some((1, false)), None, 1, true), None);
+        assert_eq!(next_sort(Some((2, false)), None, 1, true), Some((1, true)));
+    }
+
+    #[test]
+    fn next_sort_uses_declared_first_direction() {
+        // A column that should start descending (e.g. "modified date").
+        assert_eq!(next_sort(None, None, 3, false), Some((3, false)));
+        assert_eq!(next_sort(Some((3, false)), None, 3, false), Some((3, true)));
+        assert_eq!(next_sort(Some((3, true)), None, 3, false), None);
+    }
+
+    #[test]
+    fn next_sort_flips_the_default_column_on_first_click() {
+        let default = Some((5, true)); // priority ascending is the initial order
+
+        // Unsorted == default order, so the first click goes descending, not ascending again.
+        assert_eq!(next_sort(None, default, 5, true), Some((5, false)));
+        assert_eq!(next_sort(Some((5, false)), default, 5, true), None);
+        // The declared direction is ignored for the default column.
+        assert_eq!(next_sort(None, default, 5, false), Some((5, false)));
+        // Other columns are unaffected.
+        assert_eq!(next_sort(None, default, 2, true), Some((2, true)));
+    }
+
+    #[test]
+    fn next_sort_handles_a_descending_default() {
+        let default = Some((5, false));
+
+        assert_eq!(next_sort(None, default, 5, true), Some((5, true)));
+        assert_eq!(next_sort(Some((5, true)), default, 5, true), None);
     }
 
     #[test]
