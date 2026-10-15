@@ -4,9 +4,8 @@ use freya_extra::dnd_table::{
 };
 
 use crate::{
-    model::{COLUMN_TITLES, Query, build_view, reorder_visible},
+    model::{COLUMN_TITLES, ModRow, Query, apply_enabled, build_view, reorder_visible},
     state::ModManagerContext,
-    widgets::{context_menu, is_right_click, set_enabled_action},
 };
 
 fn header_cell(column: usize, resizable: bool) -> Element {
@@ -22,7 +21,7 @@ fn header_cell(column: usize, resizable: bool) -> Element {
 fn table_head() -> DndTableHead {
     DndTableHead::new().child(DndTableRow::new().header(true).children([
         header_cell(0, false),
-        header_cell(1, false),
+        header_cell(1, true),
         header_cell(2, true),
         header_cell(3, true),
         header_cell(4, true),
@@ -75,7 +74,7 @@ fn table_body(view: &[&crate::model::ModRow], context: ModManagerContext) -> Dnd
                 .position(index)
                 .children([
                     enabled_cell(row.id, row.enabled, context),
-                    text_cell(1, row.id.to_string(), false),
+                    text_cell(1, row.id.to_string(), true),
                     text_cell(2, row.name.clone(), true),
                     text_cell(3, row.mod_type.clone(), true),
                     text_cell(4, row.site.clone(), true),
@@ -166,13 +165,21 @@ impl Component for ModTable {
 }
 
 #[derive(PartialEq)]
-pub struct BulkActions;
+pub struct TableContextMenu;
 
-impl Component for BulkActions {
+impl Component for TableContextMenu {
     fn render(&self) -> impl IntoElement {
         let context = use_consume::<ModManagerContext>();
+        let mut menu = context.menu;
+        let hover = context.menu_hover;
+        let popup_area = use_state(|| None::<Area>);
 
-        let all = context.rows.read().clone();
+        let Some((x, y)) = *menu.read() else {
+            return rect().into_element();
+        };
+
+        let rows = context.rows;
+        let all = rows.read().clone();
 
         let query = Query {
             text: context.search.read().trim().to_lowercase(),
@@ -188,30 +195,104 @@ impl Component for BulkActions {
         let total = all.len();
 
         let mut menu_items: Vec<(String, Box<dyn FnMut()>)> = vec![
-            ("Enable all".to_string(), set_enabled_action(context.rows, None, true)),
-            ("Disable all".to_string(), set_enabled_action(context.rows, None, false)),
+            ("Enable all".to_string(), set_enabled_action(rows, None, true)),
+            ("Disable all".to_string(), set_enabled_action(rows, None, false)),
         ];
 
         if shown != total {
             menu_items.push((
                 format!("Enable visible ({shown})"),
-                set_enabled_action(context.rows, Some(visible_ids.clone()), true),
+                set_enabled_action(rows, Some(visible_ids.clone()), true),
             ));
-
             menu_items.push((
                 format!("Disable visible ({shown})"),
-                set_enabled_action(context.rows, Some(visible_ids), false),
+                set_enabled_action(rows, Some(visible_ids), false),
             ));
         }
 
-        let menu_position = *context.menu.read();
+        let mut entries: Vec<Element> = Vec::with_capacity(menu_items.len() + 1);
 
-        let mut root = rect().width(Size::fill()).height(Size::fill());
+        for (title, mut action) in menu_items {
+            let mut close_menu = menu;
+            let mut reset_hover = hover;
 
-        if let Some(at) = menu_position {
-            root = root.child(context_menu(at, menu_items, context.menu, context.menu_hover));
+            entries.push(
+                MenuItem::new()
+                    .theme(MenuItemThemePartial {
+                        hover_background: Some(Preference::Reference("active")),
+                        ..Default::default()
+                    })
+                    .on_press(move |_| {
+                        action();
+                        reset_hover.set(None);
+                        close_menu.set(None);
+                    })
+                    .child(title)
+                    .into_element(),
+            );
         }
 
-        root
+        let mut close_on_outside = menu;
+        let mut reset_hover = hover;
+        let mut measure_popup = popup_area;
+
+        rect()
+            .position(Position::new_absolute().left(x as f32).top(y as f32))
+            .width(Size::fill())
+            .height(Size::fill())
+            .layer(1000)
+            .on_global_pointer_down(move |event: Event<PointerEventData>| {
+                if is_right_click(&event) && popup_area.read().is_none() {
+                    let point = event.global_location();
+                    menu.set(Some((point.x, point.y)));
+                }
+            })
+            .on_global_pointer_up(move |event: Event<PointerEventData>| {
+                let point = event.global_location();
+
+                let inside_popup =
+                    popup_area.read().is_some_and(|area| contains_point(area, point.x, point.y));
+
+                if !inside_popup {
+                    reset_hover.set(None);
+                    close_on_outside.set(None);
+                }
+            })
+            .child(
+                rect()
+                    .position(Position::new_global().top(y as f32).left(x as f32))
+                    .on_sized(move |event: Event<SizedEventData>| {
+                        measure_popup.set(Some(event.area));
+                    })
+                    .child(Menu::new().children(entries)),
+            )
+            .into_element()
     }
+}
+
+fn set_enabled_action(
+    rows: State<Vec<ModRow>>,
+    scope: Option<Vec<usize>>,
+    enabled: bool,
+) -> Box<dyn FnMut()> {
+    Box::new(move || {
+        let mut state = rows;
+        let mut next = state.read().clone();
+
+        apply_enabled(&mut next, scope.as_deref(), enabled);
+        state.set(next);
+    })
+}
+
+fn contains_point(area: Area, x: f64, y: f64) -> bool {
+    let left = area.origin.x as f64;
+    let top = area.origin.y as f64;
+    let right = left + area.size.width as f64;
+    let bottom = top + area.size.height as f64;
+
+    x >= left && x <= right && y >= top && y <= bottom
+}
+
+fn is_right_click(event: &Event<PointerEventData>) -> bool {
+    event.button() == Some(MouseButton::Right)
 }

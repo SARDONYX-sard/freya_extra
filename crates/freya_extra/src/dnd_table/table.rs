@@ -774,8 +774,15 @@ impl Component for DndTableCell {
 
             // `pointer_press` fires only on the node where the pointer went down. `mouse_up`
             // also fired when a row drag was released over the header and sorted by mistake.
-            content = content
-                .on_pointer_press(move |_| sort_context.request_sort(column, first_direction));
+            content = content.on_pointer_press(move |event: Event<PointerEventData>| {
+                if matches!(
+                    event.data(),
+                    PointerEventData::Mouse(MouseEventData { button: Some(MouseButton::Left), .. })
+                        | PointerEventData::Touch(_)
+                ) {
+                    sort_context.request_sort(column, first_direction)
+                }
+            });
         }
 
         let mut parts: Vec<Element> = vec![content.children(self.children.clone()).into()];

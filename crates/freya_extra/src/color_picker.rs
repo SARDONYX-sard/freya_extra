@@ -140,6 +140,7 @@ impl Component for ColorPicker {
 
         let alpha_bar = {
             let current = *color.read();
+            let [current_r, current_g, current_b] = [current.r(), current.g(), current.b()];
             let alpha_ratio = current.a() as f32 / 255.0;
             let bar_width = alpha_area.read().to_f64().width() as f32;
             let bar_height = 18.0_f32;
@@ -163,8 +164,8 @@ impl Component for ColorPicker {
                     rect().expanded().background(
                         LinearGradient::new()
                             .angle(-90.)
-                            .stop((Color::from_argb(0, 0, 0, 0), 0.))
-                            .stop((Color::from_argb(255, 0, 0, 0), 100.)),
+                            .stop((Color::from_argb(0, current_r, current_g, current_b), 0.))
+                            .stop((Color::from_argb(255, current_r, current_g, current_b), 100.)),
                     ),
                 )
                 .child(

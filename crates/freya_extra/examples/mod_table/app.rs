@@ -3,7 +3,7 @@ use freya::prelude::*;
 use crate::{state::ModManagerContext, widgets::AppearanceMode};
 
 use super::{
-    table::{BulkActions, ModTable},
+    table::{ModTable, TableContextMenu},
     toolbar::ModToolbar,
     widgets::AppearanceSettings,
 };
@@ -35,7 +35,7 @@ impl Component for App {
                 .child(AppearanceSettings)
                 .child(ModToolbar)
                 .child(rect().expanded().width(Size::fill()).child(ModTable))
-                .child(BulkActions),
+                .child(TableContextMenu),
         )
     }
 }
