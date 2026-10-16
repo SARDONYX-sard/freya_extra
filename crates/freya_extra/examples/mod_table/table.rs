@@ -1,88 +1,54 @@
 use freya::prelude::*;
-use freya_extra::dnd_table::{
-    ColumnWidth, DndTable, DndTableBody, DndTableCell, DndTableHead, DndTableRow,
-};
+use freya_extra::dnd_table::{Column, ColumnWidth, DataTable};
 
 use crate::{
-    model::{COLUMN_TITLES, ModRow, Query, apply_enabled, build_view, reorder_visible},
+    model::{ModRow, Query, apply_enabled, apply_order, build_view},
     state::ModManagerContext,
 };
 
-fn header_cell(column: usize, resizable: bool) -> Element {
-    DndTableCell::new()
-        .column(column)
-        .header(true)
-        .title(COLUMN_TITLES[column])
-        .sortable(true)
-        .resizable(resizable)
+// An alias lets the compiler infer `R` for the closures below.
+type ModColumn = Column<ModRow>;
+
+fn enabled_cell(row: &ModRow, context: ModManagerContext) -> Element {
+    let (id, mut rows) = (row.id, context.rows);
+
+    rect()
+        .height(Size::fill())
+        .cross_align(Alignment::Center)
+        .child(Checkbox::new().selected(row.enabled).size(16.))
+        .on_focus_press(move |_| {
+            let mut next = rows.read().clone();
+
+            if let Some(row) = next.iter_mut().find(|row| row.id == id) {
+                row.enabled = !row.enabled;
+                rows.set(next);
+            }
+        })
         .into_element()
 }
 
-fn table_head() -> DndTableHead {
-    DndTableHead::new().child(DndTableRow::new().header(true).children([
-        header_cell(0, false),
-        header_cell(1, true),
-        header_cell(2, true),
-        header_cell(3, true),
-        header_cell(4, true),
-        header_cell(5, false),
-    ]))
-}
-
-fn text_cell(column: usize, text: impl Into<String>, resizable: bool) -> Element {
-    DndTableCell::new()
-        .column(column)
-        .resizable(resizable)
-        .child(
-            label()
-                .text(text.into())
-                .font_size(13.0)
-                .max_lines(1)
-                .text_overflow(TextOverflow::Ellipsis),
-        )
-        .into_element()
-}
-
-fn enabled_cell(id: usize, enabled: bool, context: ModManagerContext) -> Element {
-    let mut rows = context.rows;
-
-    DndTableCell::new()
-        .column(0)
-        .child(
-            rect()
-                .height(Size::fill())
-                .cross_align(Alignment::Center)
-                .child(Checkbox::new().selected(enabled).size(16.))
-                .on_focus_press(move |_| {
-                    let mut next = rows.read().clone();
-
-                    if let Some(row) = next.iter_mut().find(|row| row.id == id) {
-                        row.enabled = !row.enabled;
-                        rows.set(next);
-                    }
-                }),
-        )
-        .into_element()
-}
-
-fn table_body(view: &[&crate::model::ModRow], context: ModManagerContext) -> DndTableBody {
-    view.iter().enumerate().fold(DndTableBody::new(), |body, (index, row)| {
-        body.row(
-            row.id,
-            DndTableRow::new()
-                .id(row.id)
-                .position(index)
-                .children([
-                    enabled_cell(row.id, row.enabled, context),
-                    text_cell(1, row.id.to_string(), true),
-                    text_cell(2, row.name.clone(), true),
-                    text_cell(3, row.mod_type.clone(), true),
-                    text_cell(4, row.site.clone(), true),
-                    text_cell(5, row.priority.to_string(), false),
-                ])
-                .into_element(),
-        )
-    })
+fn columns(context: ModManagerContext) -> Vec<ModColumn> {
+    vec![
+        ModColumn::new("enabled", "Enabled", move |row| enabled_cell(row, context))
+            .width(ColumnWidth::Ratio(0.07))
+            .resizable(false)
+            .sort_by_key(|row| row.enabled),
+        ModColumn::text("id", "ID", |row| row.id.to_string())
+            .width(ColumnWidth::Ratio(0.05))
+            .sort_by_key(|row| row.id),
+        ModColumn::text("name", "Mod Name", |row| row.name.clone())
+            .width(ColumnWidth::Ratio(0.27))
+            .sort_by_key(|row| row.name.clone()),
+        ModColumn::text("type", "Type", |row| row.mod_type.clone())
+            .width(ColumnWidth::Ratio(0.12))
+            .sort_by_key(|row| row.mod_type.clone()),
+        ModColumn::text("url", "URL", |row| row.site.clone())
+            .width(ColumnWidth::Ratio(0.27))
+            .sort_by_key(|row| row.site.clone()),
+        ModColumn::text("priority", "Priority", |row| row.priority.to_string())
+            .width(ColumnWidth::Ratio(0.10))
+            .sort_by_key(|row| row.priority),
+    ]
 }
 
 #[derive(PartialEq)]
@@ -98,45 +64,23 @@ impl Component for ModTable {
             text: context.search.read().trim().to_lowercase(),
             filters: context.filters.read().clone(),
             enabled_only: *context.enabled_only.read(),
-            sort: *context.sort.read(),
         };
 
-        let view = build_view(&all, &query);
-        let visible_ids: Vec<usize> = view.iter().map(|row| row.id).collect();
+        let view: Vec<ModRow> = build_view(&all, &query).into_iter().cloned().collect();
+        let (shown, total) = (view.len(), all.len());
 
-        let shown = view.len();
-        let total = all.len();
+        let rows = context.rows;
+        let density = *context.density.read();
 
-        let rows_for_reorder = context.rows;
-        let sort_for_callback = context.sort;
-
-        let table = DndTable::new()
-            .columns([
-                ColumnWidth::Ratio(0.07),
-                ColumnWidth::Ratio(0.05),
-                ColumnWidth::Ratio(0.27),
-                ColumnWidth::Ratio(0.12),
-                ColumnWidth::Ratio(0.27),
-                ColumnWidth::Fill,
-            ])
-            .default_sort(Some((5, true)))
-            .density(*context.density.read())
-            .max_height(555.0)
-            .sort(query.sort)
-            .on_sort(move |next| {
-                let mut state = sort_for_callback;
-                state.set(next);
+        let table = DataTable::new(columns(context), view, |row| row.id)
+            .reorderable_rows()
+            .reorderable_columns()
+            .default_sort("priority", true)
+            .on_rows_reorder(move |ids| {
+                let mut state = rows;
+                apply_order(&mut state.write(), ids);
             })
-            .on_reorder(move |moved_id, target_id, before| {
-                let mut next = rows_for_reorder.read().clone();
-
-                if reorder_visible(&mut next, &visible_ids, moved_id, target_id, before) {
-                    let mut state = rows_for_reorder;
-                    state.set(next);
-                }
-            })
-            .child(table_head())
-            .child(table_body(&view, context));
+            .table(move |table| table.density(density).max_height(555.0));
 
         let menu = context.menu;
 
@@ -155,8 +99,8 @@ impl Component for ModTable {
             .child(
                 label()
                     .text(format!(
-                        "Drag a row onto another to change priority. \
-                         Right-click for bulk actions. ({shown} of {total} shown)"
+                        "Drag a row onto another to change priority, or a header to move its \
+                         column. Right-click for bulk actions. ({shown} of {total} shown)"
                     ))
                     .font_size(12.0),
             )
@@ -185,7 +129,6 @@ impl Component for TableContextMenu {
             text: context.search.read().trim().to_lowercase(),
             filters: context.filters.read().clone(),
             enabled_only: *context.enabled_only.read(),
-            sort: *context.sort.read(),
         };
 
         let view = build_view(&all, &query);
@@ -271,16 +214,12 @@ impl Component for TableContextMenu {
 }
 
 fn set_enabled_action(
-    rows: State<Vec<ModRow>>,
+    mut rows: State<Vec<ModRow>>,
     scope: Option<Vec<usize>>,
     enabled: bool,
 ) -> Box<dyn FnMut()> {
     Box::new(move || {
-        let mut state = rows;
-        let mut next = state.read().clone();
-
-        apply_enabled(&mut next, scope.as_deref(), enabled);
-        state.set(next);
+        apply_enabled(&mut rows.write(), scope.as_deref(), enabled);
     })
 }
 

@@ -1,5 +1,5 @@
 use freya::prelude::*;
-use freya_extra::dnd_table::{Density, SortSpec};
+use freya_extra::dnd_table::Density;
 
 use crate::{
     model::{ColumnFilter, ModRow, initial_rows},
@@ -12,7 +12,6 @@ pub struct ModManagerContext {
     pub search: State<String>,
     pub filters: State<Vec<ColumnFilter>>,
     pub enabled_only: State<bool>,
-    pub sort: State<Option<SortSpec>>,
     pub density: State<Density>,
     pub menu: State<Option<(f64, f64)>>,
     pub menu_hover: State<Option<usize>>,
@@ -26,7 +25,6 @@ impl ModManagerContext {
             search: State::create(String::new()),
             filters: State::create(Vec::new()),
             enabled_only: State::create(false),
-            sort: State::create(None),
             density: State::create(Density::default()),
             menu: State::create(None),
             menu_hover: State::create(None),

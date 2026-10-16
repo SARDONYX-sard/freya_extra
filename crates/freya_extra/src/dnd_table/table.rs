@@ -8,15 +8,21 @@ use std::sync::Arc;
 
 use freya::prelude::*;
 
-pub use super::calc::{ColumnWidth, SortDirection, SortSpec};
 use super::{
-    calc::{self, HandleState},
+    calc::{self, ColumnDrag, HandleState},
     hooks::{
-        DndTableContext, ReorderHandler, SortHandler, TableConfig, same_callback,
-        use_dnd_table_context, use_dragged_row_id, use_row_dragging, use_table_context,
+        ColumnReorderHandler, DndTableContext, ReorderHandler, SortHandler, TableConfig,
+        same_callback, use_dnd_table_context, use_dragged_column, use_dragged_row_id,
+        use_row_dragging, use_table_context,
     },
     styled::{self, use_table_colors},
 };
+pub use super::{
+    calc::{ColumnWidth, SortDirection, SortSpec},
+    styled::TableColors,
+};
+
+type ThemeHandler = Arc<dyn Fn(TableColors) -> TableColors>;
 
 fn size(width: ColumnWidth) -> Size {
     match width {
@@ -134,6 +140,8 @@ pub struct DndTable {
     default_sort: Option<SortSpec>,
     on_reorder: Option<ReorderHandler>,
     on_sort: Option<SortHandler>,
+    on_column_reorder: Option<ColumnReorderHandler>,
+    theme: Option<ThemeHandler>,
 }
 
 impl Default for DndTable {
@@ -157,6 +165,8 @@ impl DndTable {
             default_sort: None,
             on_reorder: None,
             on_sort: None,
+            on_column_reorder: None,
+            theme: None,
         }
     }
 
@@ -306,6 +316,36 @@ impl DndTable {
         self
     }
 
+    /// Override colors for this table only.
+    ///
+    /// The closure receives the colors derived from the active theme, so changing the global
+    /// theme keeps working and only the fields you touch stay fixed:
+    ///
+    /// ```ignore
+    /// DndTable::new().theme(|base| TableColors { insert_line: Color::RED, ..base })
+    /// ```
+    #[inline]
+    pub fn theme(mut self, theme: impl Fn(TableColors) -> TableColors + 'static) -> Self {
+        self.theme = Some(Arc::new(theme));
+        self
+    }
+
+    /// Set the column reorder callback, which enables moving columns by dragging their headers.
+    ///
+    /// Only header cells marked with [`DndTableCell::reorderable`] can be dragged.
+    /// Arguments are `(from_column, target_column, before)`: display indices, with `before`
+    /// `true` when the column lands on the left of the target. Apply them to your own column
+    /// list with [`move_column`](crate::dnd_table::move_column) and render the cells in the new
+    /// order, with [`DndTable::columns`] in the same order.
+    ///
+    /// Widths resized by the user move together with their column. A column that ends up last
+    /// should be declared [`ColumnWidth::Fill`], as for any last column.
+    #[inline]
+    pub fn on_column_reorder(mut self, callback: impl Fn(usize, usize, bool) + 'static) -> Self {
+        self.on_column_reorder = Some(Arc::new(callback));
+        self
+    }
+
     /// Append a child (usually a [`DndTableHead`] or a [`DndTableBody`]).
     #[inline]
     pub fn child(mut self, child: impl Into<Element>) -> Self {
@@ -323,8 +363,11 @@ impl DndTable {
 
 impl Component for DndTable {
     fn render(&self) -> impl IntoElement {
+        let base_colors = use_table_colors();
+        let colors = self.theme.as_ref().map_or(base_colors, |theme| theme(base_colors));
+
         let context = use_dnd_table_context(TableConfig {
-            colors: use_table_colors(),
+            colors,
             metrics: self.metrics,
             columns: self.columns.clone(),
             show_column_lines: self.show_column_lines,
@@ -332,8 +375,10 @@ impl Component for DndTable {
             default_sort: self.default_sort,
             on_reorder: self.on_reorder.clone(),
             on_sort: self.on_sort.clone(),
+            on_column_reorder: self.on_column_reorder.clone(),
         });
         let dragging = use_row_dragging(&context);
+        let dragged_column = use_dragged_column();
 
         let outer_width = match self.fixed_width {
             Some(width) => Size::px(width),
@@ -350,11 +395,16 @@ impl Component for DndTable {
 
             if dragging {
                 move_context.update_drag(pointer_y);
+            } else {
+                move_context.update_column_drag(dragged_column, pointer_x, pointer_y);
             }
         };
 
         let mut up_context = context.clone();
-        let on_global_pointer_up = move |_| up_context.end_resize();
+        let on_global_pointer_up = move |_| {
+            up_context.end_resize();
+            up_context.finish_column_drag();
+        };
 
         // `Ratio` columns are resolved against this width.
         let mut table_width = context.table_width;
@@ -394,6 +444,8 @@ impl PartialEq for DndTable {
             && self.default_sort == other.default_sort
             && same_callback(&self.on_reorder, &other.on_reorder)
             && same_callback(&self.on_sort, &other.on_sort)
+            && same_callback(&self.on_column_reorder, &other.on_column_reorder)
+            && same_callback(&self.theme, &other.theme)
     }
 }
 
@@ -647,6 +699,7 @@ pub struct DndTableCell {
     sortable: bool,
     first_direction: SortDirection,
     resizable: bool,
+    reorderable: bool,
 }
 
 impl DndTableCell {
@@ -714,6 +767,15 @@ impl DndTableCell {
         self.resizable = enabled;
         self
     }
+
+    /// Allow the user to move the column by dragging this header cell.
+    ///
+    /// Has no effect unless the table has an [`DndTable::on_column_reorder`] callback.
+    #[inline]
+    pub fn reorderable(mut self, enabled: bool) -> Self {
+        self.reorderable = enabled;
+        self
+    }
 }
 
 impl Component for DndTableCell {
@@ -721,7 +783,16 @@ impl Component for DndTableCell {
         let context = use_table_context();
         let column = self.column.unwrap_or(0);
 
-        let (metrics, colors, show_column_lines, column_count, declared_width, sort, default_sort) = {
+        let (
+            metrics,
+            colors,
+            show_column_lines,
+            column_count,
+            declared_width,
+            sort,
+            default_sort,
+            can_reorder_columns,
+        ) = {
             let config = context.config.read();
 
             (
@@ -732,10 +803,13 @@ impl Component for DndTableCell {
                 config.columns.get(column).copied(),
                 config.sort,
                 config.default_sort,
+                config.on_column_reorder.is_some(),
             )
         };
 
         let row_dragging = use_dragged_row_id().is_some();
+        let dragged_column = use_dragged_column();
+        let reorderable = self.is_header && self.reorderable && can_reorder_columns;
         let is_last = calc::is_last_column(column, column_count);
 
         let width = calc::resolve_column_width(
@@ -768,6 +842,22 @@ impl Component for DndTableCell {
             }
         }
 
+        if self.is_header {
+            content = content.opacity(styled::column_opacity(dragged_column == Some(column)));
+
+            // Every header press resets the "a header drag just happened" flag, and tells the
+            // table where it is on screen for the column drop calculation.
+            let mut press_context = context.clone();
+
+            content = content.on_pointer_down(move |event: Event<PointerEventData>| {
+                press_context.begin_header_press(
+                    column,
+                    event.global_location().to_tuple(),
+                    event.element_location().to_tuple(),
+                );
+            });
+        }
+
         if self.is_header && self.sortable {
             let sort_context = context.clone();
             let first_direction = self.first_direction;
@@ -785,12 +875,38 @@ impl Component for DndTableCell {
             });
         }
 
-        let mut parts: Vec<Element> = vec![content.children(self.children.clone()).into()];
+        let content = content.children(self.children.clone());
+
+        let content: Element = match (&self.title, reorderable) {
+            (Some(title), true) => DragZone::new(ColumnDrag(column))
+                .enabled(!context.is_resizing() && !row_dragging)
+                .width(size(content_width))
+                .height(Size::fill())
+                .drag_element(styled::column_drag_ghost(
+                    title.clone(),
+                    metrics.header_height,
+                    metrics.cell_padding,
+                    colors,
+                ))
+                .show_while_dragging(true)
+                .child(content)
+                .into(),
+            _ => content.into(),
+        };
+
+        let mut parts: Vec<Element> = vec![content];
 
         if resizable && let ColumnWidth::Px(px) = width {
             parts.push(resize_handle(&context, metrics, colors, column, px, row_dragging));
         } else if show_column_lines && !is_last {
             parts.push(styled::grid_separator(colors));
+        }
+
+        if reorderable
+            && let Some(edge) =
+                calc::column_marker(*context.column_drop.read(), column, column_count)
+        {
+            parts.push(styled::column_marker(edge, metrics.header_height, colors));
         }
 
         rect().horizontal().width(size(width)).height(Size::fill()).spacing(0.0).children(parts)

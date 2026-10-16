@@ -4,25 +4,33 @@ use std::time::Duration;
 
 use freya::{animation::Function, prelude::*};
 
-use super::{TableMetrics, calc::HandleState};
+use super::{
+    TableMetrics,
+    calc::{ColumnMarker, HandleState},
+};
 
-// Every color comes from the active theme.
-#[derive(Clone, Copy, PartialEq)]
-pub(super) struct TableColors {
+/// Every color of a [`DndTable`](super::DndTable).
+///
+/// The defaults are derived from the active theme. Override them for one table with
+/// [`DndTable::theme`](super::DndTable::theme).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TableColors {
     pub header_background: Color,
     pub header_button_background: Color,
     pub header_text: Color,
     pub row_even: Color,
     pub row_odd: Color,
     pub grid_line: Color,
+    /// Row drop line and column drop marker.
     pub insert_line: Color,
     pub resize_hover: Color,
     pub resize_active: Color,
     pub ghost_background: Color,
 }
 
+// Falls back to the default theme when no theme is provided.
 pub(super) fn use_table_colors() -> TableColors {
-    let colors = use_theme().read().colors.clone();
+    let colors = get_theme_or_default().read().colors.clone();
 
     TableColors {
         header_background: colors.surface_secondary,
@@ -88,6 +96,43 @@ pub(super) fn resize_line(
     };
 
     rect().width(Size::px(width)).height(Size::fill()).background(color).into()
+}
+
+pub(super) fn column_opacity(is_dragged: bool) -> f32 {
+    if is_dragged { 0.5 } else { 1.0 }
+}
+
+// Vertical bar on one edge of a header cell, marking where the dragged column would land.
+// Absolutely positioned, so it does not take part in the cell's layout.
+pub(super) fn column_marker(edge: ColumnMarker, height: f32, colors: TableColors) -> Element {
+    let position = Position::new_absolute().top(0.0);
+    let position = match edge {
+        ColumnMarker::Left => position.left(0.0),
+        ColumnMarker::Right => position.right(0.0),
+    };
+
+    rect()
+        .position(position)
+        .width(Size::px(3.0))
+        .height(Size::px(height))
+        .background(colors.insert_line)
+        .into()
+}
+
+// Follows the pointer while a header is dragged. Must not intercept pointer events.
+pub(super) fn column_drag_ghost(
+    title: String,
+    height: f32,
+    padding: f32,
+    colors: TableColors,
+) -> Rect {
+    rect()
+        .interactive(false)
+        .background(colors.ghost_background)
+        .height(Size::px(height))
+        .padding(padding)
+        .opacity(0.85)
+        .child(header_label(title, colors))
 }
 
 pub(super) fn row_opacity(is_dragged: bool) -> f32 {

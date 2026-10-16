@@ -1,5 +1,7 @@
 // Pure, UI-independent calculations for `DndTable`.
 
+use std::{collections::HashSet, hash::Hash};
+
 /// Active sort: `(column_index, ascending)`.
 pub type SortSpec = (usize, bool);
 
@@ -28,6 +30,52 @@ pub enum ColumnWidth {
     Fill,
 }
 
+/// Move `items[from]` next to `items[target]`: before it when `before`, after it otherwise.
+///
+/// Returns `false`, leaving `items` untouched, when an index is out of range or the move
+/// would not change the order. Use it to apply the arguments of
+/// [`DndTable::on_column_reorder`](super::DndTable::on_column_reorder) to your own column list.
+pub fn move_column<T>(items: &mut Vec<T>, from: usize, target: usize, before: bool) -> bool {
+    let boundary = target + usize::from(!before);
+
+    if from >= items.len() || target >= items.len() || is_noop_move(from, boundary) {
+        return false;
+    }
+
+    let item = items.remove(from);
+    // Removing the item shifts every boundary behind it by one.
+    let index = if from < boundary { boundary - 1 } else { boundary };
+    items.insert(index, item);
+
+    true
+}
+
+// Dropping a column at the boundary on either of its own sides keeps the order.
+const fn is_noop_move(from: usize, boundary: usize) -> bool {
+    boundary == from || boundary == from + 1
+}
+
+// Keep the entries of `order` that are still `present`, then append the new ones.
+pub(super) fn reconcile_order<K: Clone + Eq + Hash>(order: &[K], present: &[K]) -> Vec<K> {
+    let present_set: HashSet<&K> = present.iter().collect();
+    let mut result: Vec<K> =
+        order.iter().filter(|key| present_set.contains(key)).cloned().collect();
+    let known: HashSet<&K> = order.iter().collect();
+
+    result.extend(present.iter().filter(|key| !known.contains(key)).cloned());
+    result
+}
+
+// Keep every entry of `known`, even absent ones (e.g. filtered-out rows keep their place),
+// then append the `present` entries that were never seen.
+pub(super) fn merge_known_order<K: Clone + Eq + Hash>(known: &[K], present: &[K]) -> Vec<K> {
+    let seen: HashSet<&K> = known.iter().collect();
+    let mut result = known.to_vec();
+
+    result.extend(present.iter().filter(|key| !seen.contains(key)).cloned());
+    result
+}
+
 // Freya stores the vertical scroll position as a non-positive value (0 at the top),
 // while all geometry math uses a non-negative "scrolled distance".
 const SCROLL_Y_SIGN: i32 = -1;
@@ -49,6 +97,32 @@ pub(super) enum DropPosition {
 pub(super) struct DropTarget {
     pub row_id: usize,
     pub position: DropPosition,
+}
+
+// Drag payload of a header cell: the display index of the dragged column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ColumnDrag(pub usize);
+
+// Where the dragged column would land: next to `target`, on its left when `before`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ColumnDropTarget {
+    pub from: usize,
+    pub target: usize,
+    pub before: bool,
+}
+
+impl ColumnDropTarget {
+    // Insertion boundary in `0..=column_count`, measured before removing the dragged column.
+    pub(super) const fn boundary(self) -> usize {
+        self.target + if self.before { 0 } else { 1 }
+    }
+}
+
+// Edge of a header cell that carries the insertion marker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ColumnMarker {
+    Left,
+    Right,
 }
 
 // Vertical row bounds in global coordinates.
@@ -239,7 +313,12 @@ pub(super) fn resolve_column_width(
         }
     };
 
-    if let Some(ratio) = override_ratio {
+    // A moved column may carry an override into the last slot, which has to keep filling.
+    let keeps_fill = is_last && matches!(declared, Some(ColumnWidth::Fill));
+
+    if let Some(ratio) = override_ratio
+        && !keeps_fill
+    {
         return to_px(ratio);
     }
 
@@ -269,6 +348,93 @@ pub(super) fn content_width(width: ColumnWidth, handle_width: f32, separator: f3
         ColumnWidth::Px(px) => ColumnWidth::Px((px - handle_width - separator).max(0.0)),
         // `Ratio` is always resolved to `Px` before this point.
         ColumnWidth::Ratio(_) | ColumnWidth::Fill => width,
+    }
+}
+
+// Pixel width of every column. `Fill` takes what the fixed columns leave over.
+pub(super) fn pixel_widths(
+    widths: &[ColumnWidth],
+    table_width: f32,
+    min_column_width: f32,
+) -> Vec<f32> {
+    let fixed: f32 = widths
+        .iter()
+        .map(|width| match width {
+            ColumnWidth::Px(px) => *px,
+            ColumnWidth::Ratio(ratio) => ratio * table_width,
+            ColumnWidth::Fill => 0.0,
+        })
+        .sum();
+    let fill = (table_width - fixed).max(min_column_width);
+
+    widths
+        .iter()
+        .map(|width| match width {
+            ColumnWidth::Px(px) => *px,
+            ColumnWidth::Ratio(ratio) => ratio * table_width,
+            ColumnWidth::Fill => fill,
+        })
+        .collect()
+}
+
+// `(left, right)` of every column in global coordinates, from the table's left edge.
+pub(super) fn column_bounds(pixel_widths: &[f32], table_left: f64) -> Vec<(f64, f64)> {
+    let mut left = table_left;
+
+    pixel_widths
+        .iter()
+        .map(|width| {
+            let right = left + f64::from(*width);
+            let bounds = (left, right);
+            left = right;
+            bounds
+        })
+        .collect()
+}
+
+// A column can be dropped while the pointer is within one header height of the header.
+pub(super) fn header_drop_band(table_top: f64, header_height: f32) -> (f64, f64) {
+    let height = f64::from(header_height);
+
+    (table_top - height, table_top + height * 2.0)
+}
+
+// Left of the first column counts as before it, right of the last one as after it.
+// `None` outside the band, or when the drop would not change the order.
+pub(super) fn find_column_drop_target(
+    bounds: &[(f64, f64)],
+    from: usize,
+    pointer_x: f64,
+    pointer_y: f64,
+    band: (f64, f64),
+) -> Option<ColumnDropTarget> {
+    if pointer_y < band.0 || pointer_y >= band.1 {
+        return None;
+    }
+
+    let last = bounds.len().checked_sub(1)?;
+    let target = bounds.iter().position(|(_, right)| pointer_x < *right).unwrap_or(last);
+    let (left, right) = *bounds.get(target)?;
+    let before = pointer_x < left + (right - left) / 2.0;
+
+    let drop = ColumnDropTarget { from, target, before };
+
+    (!is_noop_move(from, drop.boundary())).then_some(drop)
+}
+
+pub(super) fn column_marker(
+    target: Option<ColumnDropTarget>,
+    column: usize,
+    column_count: usize,
+) -> Option<ColumnMarker> {
+    let boundary = target?.boundary();
+
+    if boundary == column {
+        Some(ColumnMarker::Left)
+    } else if boundary == column_count && is_last_column(column, column_count) {
+        Some(ColumnMarker::Right)
+    } else {
+        None
     }
 }
 
@@ -543,5 +709,135 @@ mod tests {
         assert_eq!(HandleState::resolve(true, true), HandleState::Active);
         assert_eq!(HandleState::resolve(false, true), HandleState::Hovered);
         assert_eq!(HandleState::resolve(false, false), HandleState::Idle);
+    }
+
+    #[test]
+    fn move_column_places_item_before_or_after_target() {
+        let moved = |from, target, before| {
+            let mut items = vec!['a', 'b', 'c', 'd'];
+            move_column(&mut items, from, target, before).then_some(items)
+        };
+
+        assert_eq!(moved(0, 2, false), Some(vec!['b', 'c', 'a', 'd']));
+        assert_eq!(moved(0, 2, true), Some(vec!['b', 'a', 'c', 'd']));
+        assert_eq!(moved(3, 1, true), Some(vec!['a', 'd', 'b', 'c']));
+        assert_eq!(moved(3, 1, false), Some(vec!['a', 'b', 'd', 'c']));
+        assert_eq!(moved(0, 3, false), Some(vec!['b', 'c', 'd', 'a']));
+        assert_eq!(moved(3, 0, true), Some(vec!['d', 'a', 'b', 'c']));
+    }
+
+    #[test]
+    fn move_column_rejects_noops_and_out_of_range() {
+        let mut items = vec!['a', 'b', 'c'];
+
+        assert!(!move_column(&mut items, 1, 1, true));
+        assert!(!move_column(&mut items, 1, 1, false));
+        assert!(!move_column(&mut items, 1, 0, false));
+        assert!(!move_column(&mut items, 1, 2, true));
+        assert!(!move_column(&mut items, 3, 0, true));
+        assert!(!move_column(&mut items, 0, 3, true));
+        assert_eq!(items, vec!['a', 'b', 'c']);
+    }
+
+    #[test]
+    fn resolve_column_width_keeps_the_last_fill_column_filling() {
+        use ColumnWidth::{Fill, Px};
+
+        // A resized column dropped into the last slot must not stop filling.
+        assert_eq!(resolve_column_width(Some(0.25), Some(Fill), true, 48.0, 1200.0, 800.0), Fill);
+        // A fixed last column still honors the override.
+        assert_eq!(
+            resolve_column_width(Some(0.25), Some(Px(100.0)), true, 48.0, 1200.0, 800.0),
+            Px(200.0)
+        );
+    }
+
+    #[test]
+    fn pixel_widths_give_fill_the_remaining_width() {
+        use ColumnWidth::{Fill, Px, Ratio};
+
+        assert_eq!(
+            pixel_widths(&[Px(100.0), Ratio(0.25), Fill], 800.0, 48.0),
+            vec![100.0, 200.0, 500.0]
+        );
+        assert_eq!(pixel_widths(&[Px(790.0), Fill], 800.0, 48.0), vec![790.0, 48.0]);
+    }
+
+    #[test]
+    fn column_bounds_are_contiguous() {
+        assert_eq!(
+            column_bounds(&[100.0, 50.0, 25.0], 10.0),
+            vec![(10.0, 110.0), (110.0, 160.0), (160.0, 185.0)]
+        );
+    }
+
+    #[test]
+    fn find_column_drop_target_picks_column_and_side() {
+        let bounds = column_bounds(&[100.0, 100.0, 100.0], 0.0);
+        let band = header_drop_band(0.0, 40.0);
+        let find = |from, x, y| find_column_drop_target(&bounds, from, x, y, band);
+
+        assert_eq!(
+            find(0, 160.0, 10.0),
+            Some(ColumnDropTarget { from: 0, target: 1, before: false })
+        );
+        assert_eq!(
+            find(2, 110.0, 10.0),
+            Some(ColumnDropTarget { from: 2, target: 1, before: true })
+        );
+        // Outside the table the nearest end column is used.
+        assert_eq!(
+            find(2, -50.0, 10.0),
+            Some(ColumnDropTarget { from: 2, target: 0, before: true })
+        );
+        assert_eq!(
+            find(0, 900.0, 10.0),
+            Some(ColumnDropTarget { from: 0, target: 2, before: false })
+        );
+        // No-op: next to the dragged column's own slot.
+        assert_eq!(find(1, 150.0, 10.0), None);
+        assert_eq!(find(1, 120.0, 10.0), None);
+        assert_eq!(find(0, 110.0, 10.0), None);
+        assert_eq!(find(0, 50.0, 10.0), None);
+        // Before the column after the next one is a real move.
+        assert_eq!(
+            find(0, 210.0, 10.0),
+            Some(ColumnDropTarget { from: 0, target: 2, before: true })
+        );
+        // Vertical band: one header height of slack on each side.
+        assert!(find(0, 160.0, -40.0).is_some());
+        assert_eq!(find(0, 160.0, -41.0), None);
+        assert_eq!(find(0, 160.0, 80.0), None);
+        assert!(find(0, 160.0, 79.0).is_some());
+        assert_eq!(find_column_drop_target(&[], 0, 0.0, 0.0, band), None);
+    }
+
+    #[test]
+    fn column_marker_sits_on_the_insertion_boundary() {
+        let before_2 = Some(ColumnDropTarget { from: 0, target: 2, before: true });
+        let after_1 = Some(ColumnDropTarget { from: 0, target: 1, before: false });
+        let after_last = Some(ColumnDropTarget { from: 0, target: 2, before: false });
+
+        assert_eq!(column_marker(before_2, 2, 3), Some(ColumnMarker::Left));
+        assert_eq!(column_marker(before_2, 1, 3), None);
+        // "After column 1" and "before column 2" are the same boundary.
+        assert_eq!(column_marker(after_1, 2, 3), Some(ColumnMarker::Left));
+        assert_eq!(column_marker(after_last, 2, 3), Some(ColumnMarker::Right));
+        assert_eq!(column_marker(after_last, 1, 3), None);
+        assert_eq!(column_marker(None, 0, 3), None);
+    }
+
+    #[test]
+    fn reconcile_order_drops_missing_and_appends_new() {
+        assert_eq!(reconcile_order(&["b", "a", "c"], &["a", "b", "c"]), vec!["b", "a", "c"]);
+        assert_eq!(reconcile_order(&["b", "a", "c"], &["a", "d", "b"]), vec!["b", "a", "d"]);
+        assert_eq!(reconcile_order::<&str>(&[], &["x", "y"]), vec!["x", "y"]);
+    }
+
+    #[test]
+    fn merge_known_order_keeps_hidden_entries_in_place() {
+        // 2 is currently filtered out but keeps its slot; 9 is new.
+        assert_eq!(merge_known_order(&[3, 2, 1], &[1, 3, 9]), vec![3, 2, 1, 9]);
+        assert_eq!(merge_known_order(&[], &[5, 4]), vec![5, 4]);
     }
 }

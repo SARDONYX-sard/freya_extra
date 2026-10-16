@@ -1,10 +1,9 @@
 use freya::prelude::*;
 
 use super::liquid_glass::LIQUID_GLASS_COLORS;
-use crate::color_picker::ColorPicker;
-use crate::dropdown_menu::DropdownMenu;
-use crate::floating_window::FloatingWindow;
-use crate::themes;
+use crate::{
+    color_picker::ColorPicker, dropdown_menu::DropdownMenu, floating_window::FloatingWindow, themes,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ThemeMode {

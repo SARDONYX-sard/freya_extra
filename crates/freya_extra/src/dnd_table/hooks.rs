@@ -6,13 +6,18 @@ use freya::prelude::*;
 
 use super::{
     TableMetrics,
-    calc::{self, ColumnWidth, DropTarget, ResizeState, SortDirection, SortSpec},
+    calc::{
+        self, ColumnDrag, ColumnDropTarget, ColumnWidth, DropTarget, ResizeState, SortDirection,
+        SortSpec,
+    },
     styled::TableColors,
 };
 
 // Callback arguments: dragged row ID, target row ID, `true` when inserting before the target.
 pub(super) type ReorderHandler = Arc<dyn Fn(usize, usize, bool)>;
 pub(super) type SortHandler = Arc<dyn Fn(Option<SortSpec>)>;
+// Callback arguments: dragged column index, target column index, `true` when inserting before it.
+pub(super) type ColumnReorderHandler = Arc<dyn Fn(usize, usize, bool)>;
 
 // Per-render snapshot shared with descendants.
 #[derive(Clone)]
@@ -26,6 +31,7 @@ pub(super) struct TableConfig {
     pub default_sort: Option<SortSpec>,
     pub on_reorder: Option<ReorderHandler>,
     pub on_sort: Option<SortHandler>,
+    pub on_column_reorder: Option<ColumnReorderHandler>,
 }
 
 pub(super) fn same_callback<T: ?Sized>(a: &Option<Arc<T>>, b: &Option<Arc<T>>) -> bool {
@@ -46,6 +52,7 @@ impl PartialEq for TableConfig {
             && self.default_sort == other.default_sort
             && same_callback(&self.on_reorder, &other.on_reorder)
             && same_callback(&self.on_sort, &other.on_sort)
+            && same_callback(&self.on_column_reorder, &other.on_column_reorder)
     }
 }
 
@@ -62,6 +69,11 @@ pub(super) struct DndTableContext {
     pub viewport_bounds: State<Option<(f64, f64)>>,
     pub resize_state: State<Option<ResizeState>>,
     pub hovered_boundary: State<Option<usize>>,
+    // Global position of the table's top-left corner, taken when a header drag starts.
+    pub table_origin: State<(f64, f64)>,
+    pub column_drop: State<Option<ColumnDropTarget>>,
+    // A header drag started since the last header press; its release must not sort.
+    pub column_drag_moved: State<bool>,
     pub scroll_controller: ScrollController,
 }
 
@@ -73,6 +85,9 @@ pub(super) fn use_dnd_table_context(next_config: TableConfig) -> DndTableContext
     let resize_state = use_state(|| None::<ResizeState>);
     let hovered_boundary = use_state(|| None::<usize>);
     let table_width = use_state(|| 0.0_f32);
+    let table_origin = use_state(|| (0.0_f64, 0.0_f64));
+    let column_drop = use_state(|| None::<ColumnDropTarget>);
+    let column_drag_moved = use_state(|| false);
     let column_count = next_config.columns.len();
     let column_width_overrides = use_state(|| vec![None; column_count]);
     let scroll_controller = use_scroll_controller(ScrollConfig::default);
@@ -91,6 +106,9 @@ pub(super) fn use_dnd_table_context(next_config: TableConfig) -> DndTableContext
         viewport_bounds,
         resize_state,
         hovered_boundary,
+        table_origin,
+        column_drop,
+        column_drag_moved,
         scroll_controller,
     };
 
@@ -105,6 +123,11 @@ pub(super) fn use_table_context() -> DndTableContext {
 
 pub(super) fn use_dragged_row_id() -> Option<usize> {
     *use_drag::<usize>().read()
+}
+
+// Display index of the column whose header is being dragged.
+pub(super) fn use_dragged_column() -> Option<usize> {
+    (*use_drag::<ColumnDrag>().read()).map(|ColumnDrag(column)| column)
 }
 
 // A row drag is in progress and no column resize is.
@@ -203,6 +226,104 @@ impl DndTableContext {
         }
     }
 
+    // --- Column drag & drop ------------------------------------------------------------------
+
+    // Pixel width of every column as laid out right now.
+    fn column_pixel_widths(&self) -> Vec<f32> {
+        let (metrics, columns) = {
+            let config = self.config.read();
+            (config.metrics, config.columns.clone())
+        };
+        let table_width = self.table_width();
+        let count = columns.len();
+
+        let resolved: Vec<ColumnWidth> = (0..count)
+            .map(|column| {
+                calc::resolve_column_width(
+                    self.column_width_override(column),
+                    columns.get(column).copied(),
+                    calc::is_last_column(column, count),
+                    metrics.min_column_width,
+                    metrics.max_column_width,
+                    table_width,
+                )
+            })
+            .collect();
+
+        calc::pixel_widths(&resolved, table_width, metrics.min_column_width)
+    }
+
+    // The pointer went down on the header cell of `column`. `(local_x, local_y)` is the pointer
+    // position inside that cell, which is how the table finds its own origin on screen.
+    pub(super) fn begin_header_press(
+        &mut self,
+        column: usize,
+        (global_x, global_y): (f64, f64),
+        (local_x, local_y): (f64, f64),
+    ) {
+        self.column_drag_moved.set_if_modified(false);
+
+        let widths = self.column_pixel_widths();
+        let cell_offset: f32 = widths.iter().take(column).sum();
+
+        self.table_origin
+            .set_if_modified((global_x - local_x - f64::from(cell_offset), global_y - local_y));
+    }
+
+    // Recompute the drop target while a header is dragged.
+    pub(super) fn update_column_drag(
+        &mut self,
+        dragged: Option<usize>,
+        pointer_x: f64,
+        pointer_y: f64,
+    ) {
+        let Some(from) = dragged else {
+            self.column_drop.set_if_modified(None);
+            return;
+        };
+
+        self.column_drag_moved.set_if_modified(true);
+
+        let (table_left, table_top) = *self.table_origin.read();
+        let header_height = self.metrics().header_height;
+        let bounds = calc::column_bounds(&self.column_pixel_widths(), table_left);
+        let band = calc::header_drop_band(table_top, header_height);
+
+        self.column_drop.set_if_modified(calc::find_column_drop_target(
+            &bounds, from, pointer_x, pointer_y, band,
+        ));
+    }
+
+    // Apply the last drop target. Called on every pointer release; does nothing without one.
+    pub(super) fn finish_column_drag(&mut self) {
+        let target = *self.column_drop.read();
+
+        let Some(target) = target else {
+            return;
+        };
+
+        self.column_drop.set(None);
+
+        let (callback, column_count) = {
+            let config = self.config.read();
+            (config.on_column_reorder.clone(), config.columns.len())
+        };
+
+        let Some(callback) = callback else {
+            return;
+        };
+
+        // The resized widths belong to the columns, so they travel with them.
+        let mut widths = self.column_width_overrides.read().clone();
+        widths.resize(widths.len().max(column_count), None);
+
+        if calc::move_column(&mut widths, target.from, target.target, target.before) {
+            self.column_width_overrides.set(widths);
+        }
+
+        callback(target.from, target.target, target.before);
+    }
+
     // --- Row drag & drop ---------------------------------------------------------------------
 
     pub(super) fn sync_row_ids(&mut self, ids: &[usize]) {
@@ -292,7 +413,7 @@ impl DndTableContext {
 
     // `first_direction`: direction of the first click, declared by the header cell.
     pub(super) fn request_sort(&self, column: usize, first_direction: SortDirection) {
-        if self.is_resizing() {
+        if self.is_resizing() || *self.column_drag_moved.read() {
             return;
         }
 

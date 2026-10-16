@@ -1,6 +1,4 @@
-use std::cmp::Ordering;
-
-use freya_extra::dnd_table::SortSpec;
+use std::collections::HashMap;
 
 #[derive(Clone, PartialEq)]
 pub struct ModRow {
@@ -11,8 +9,6 @@ pub struct ModRow {
     pub mod_type: String,
     pub site: String,
 }
-
-pub const COLUMN_TITLES: [&str; 6] = ["Enabled", "ID", "Mod Name", "Type", "URL", "Priority"];
 
 pub fn initial_rows() -> Vec<ModRow> {
     let mut rows = (1..=99)
@@ -87,19 +83,6 @@ pub struct Query {
     pub text: String,
     pub filters: Vec<ColumnFilter>,
     pub enabled_only: bool,
-    pub sort: Option<SortSpec>,
-}
-
-fn compare_by_column(column: usize, a: &ModRow, b: &ModRow) -> Ordering {
-    match column {
-        0 => a.enabled.cmp(&b.enabled),
-        1 => a.id.cmp(&b.id),
-        2 => a.name.cmp(&b.name),
-        3 => a.mod_type.cmp(&b.mod_type),
-        4 => a.site.cmp(&b.site),
-        5 => a.priority.cmp(&b.priority),
-        _ => Ordering::Equal,
-    }
 }
 
 fn matches_filter(row: &ModRow, filter: &ColumnFilter) -> bool {
@@ -153,16 +136,7 @@ pub fn matches_query(row: &ModRow, query: &Query) -> bool {
 }
 
 pub fn build_view<'a>(rows: &'a [ModRow], query: &Query) -> Vec<&'a ModRow> {
-    let mut view: Vec<&ModRow> = rows.iter().filter(|row| matches_query(row, query)).collect();
-
-    if let Some((column, ascending)) = query.sort {
-        view.sort_by(|a, b| {
-            let ordering = compare_by_column(column, a, b);
-            if ascending { ordering } else { ordering.reverse() }
-        });
-    }
-
-    view
+    rows.iter().filter(|row| matches_query(row, query)).collect()
 }
 
 pub fn normalize_priorities(rows: &mut [ModRow]) {
@@ -171,43 +145,12 @@ pub fn normalize_priorities(rows: &mut [ModRow]) {
     }
 }
 
-pub fn reorder_visible(
-    rows: &mut Vec<ModRow>,
-    visible_ids: &[usize],
-    moved_id: usize,
-    target_id: usize,
-    before: bool,
-) -> bool {
-    if moved_id == target_id
-        || !visible_ids.contains(&moved_id)
-        || !visible_ids.contains(&target_id)
-    {
-        return false;
-    }
+/// Reorder `rows` to follow `ids` (the table's row order) and renumber the priorities.
+pub fn apply_order(rows: &mut [ModRow], ids: &[usize]) {
+    let position: HashMap<usize, usize> = ids.iter().enumerate().map(|(i, id)| (*id, i)).collect();
 
-    let Some(moved_index) = rows.iter().position(|row| row.id == moved_id) else {
-        return false;
-    };
-
-    let Some(target_index) = rows.iter().position(|row| row.id == target_id) else {
-        return false;
-    };
-
-    let target_key = rows[target_index].priority as i64 * 2;
-    let moved_key = if before { target_key - 1 } else { target_key + 1 };
-
-    let moved = rows.remove(moved_index);
-
-    let mut keyed: Vec<(i64, ModRow)> =
-        rows.drain(..).map(|row| (row.priority as i64 * 2, row)).collect();
-
-    keyed.push((moved_key, moved));
-    keyed.sort_by_key(|(key, _)| *key);
-
-    rows.extend(keyed.into_iter().map(|(_, row)| row));
+    rows.sort_by_key(|row| position.get(&row.id).copied().unwrap_or(usize::MAX));
     normalize_priorities(rows);
-
-    true
 }
 
 pub fn apply_enabled(rows: &mut [ModRow], scope: Option<&[usize]>, enabled: bool) {

@@ -1,12 +1,11 @@
 use freya::prelude::*;
 
-use crate::{state::ModManagerContext, widgets::AppearanceMode};
-
 use super::{
     table::{ModTable, TableContextMenu},
     toolbar::ModToolbar,
     widgets::AppearanceSettings,
 };
+use crate::{state::ModManagerContext, widgets::AppearanceMode};
 
 #[derive(PartialEq)]
 pub struct App;

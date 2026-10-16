@@ -1,5 +1,7 @@
-use freya::prelude::*;
-use freya::torin::prelude::{Area, Size2D};
+use freya::{
+    prelude::*,
+    torin::prelude::{Area, Size2D},
+};
 use freya_extra::dropdown_menu::DropdownMenu;
 
 use crate::{

@@ -12,7 +12,7 @@ pub fn theme() -> Theme {
 
 pub const LIQUID_GLASS_COLORS: ColorsSheet = ColorsSheet {
     // Brand and Accent
-    primary: hex("#736F6FFF"),
+    primary: hex("#D7D7D7FF"),
     secondary: hex("#FFFFFFFF"),
     tertiary: hex("#EEEEEEFF"),
 

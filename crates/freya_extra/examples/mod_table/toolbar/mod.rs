@@ -2,13 +2,12 @@ mod column_filter;
 mod density_select;
 mod quick_search;
 
-use freya::prelude::*;
-
-use crate::state::ModManagerContext;
-
 pub use column_filter::ColumnFilterEditor as ColumnFilter;
 pub use density_select::DensitySelect;
+use freya::prelude::*;
 pub use quick_search::QuickSearch;
+
+use crate::state::ModManagerContext;
 
 #[derive(PartialEq)]
 pub struct ModToolbar;
